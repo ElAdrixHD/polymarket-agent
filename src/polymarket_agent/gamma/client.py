@@ -139,6 +139,112 @@ def _text_matches(market: dict[str, Any], keywords: list[str]) -> bool:
     return any(kw.lower() in text for kw in keywords)
 
 
+# Timeframe keywords that indicate short-term up/down markets
+_SHORT_TERM_KEYWORDS: set[str] = {
+    "5min", "5m", "15min", "15m", "1h", "1hour",
+    "up or down", "updown",
+}
+
+
+def _is_short_term_query(terms: list[str]) -> bool:
+    """Detect if the query targets short-term (5m/15m/1h) up/down markets."""
+    return any(t.lower().strip() in _SHORT_TERM_KEYWORDS for t in terms)
+
+
+def _filter_short_term_markets(
+    markets: list[dict[str, Any]],
+    terms: list[str],
+) -> list[dict[str, Any]]:
+    """For short-term queries, keep only up/down markets and pick the live one per asset.
+
+    1. Filter to only markets whose slug matches the updown pattern
+       (e.g. btc-updown-15m-...) or whose question contains "up or down".
+    2. If the user specified an asset (btc, eth, sol, xrp), filter to that asset only.
+    3. Group by asset+timeframe prefix and keep only the nearest-expiring (= live now).
+    """
+    import re
+
+    now = datetime.now(timezone.utc)
+
+    # Determine which asset(s) the user asked about
+    asset_keywords = {"btc", "bitcoin", "eth", "ethereum", "sol", "solana", "xrp"}
+    requested_assets: set[str] = set()
+    for t in terms:
+        low = t.lower().strip()
+        if low in asset_keywords:
+            # Normalize to slug prefix form
+            asset_map = {
+                "btc": "btc", "bitcoin": "btc",
+                "eth": "eth", "ethereum": "eth",
+                "sol": "sol", "solana": "sol",
+                "xrp": "xrp",
+            }
+            if low in asset_map:
+                requested_assets.add(asset_map[low])
+
+    # Determine which timeframe(s) the user asked about
+    timeframe_keywords = {
+        "5min": "5m", "5m": "5m", "5": "5m",
+        "15min": "15m", "15m": "15m", "15": "15m",
+        "1h": "1h", "1hour": "1h",
+    }
+    requested_timeframes: set[str] = set()
+    for t in terms:
+        low = t.lower().strip()
+        if low in timeframe_keywords:
+            requested_timeframes.add(timeframe_keywords[low])
+
+    # Step 1: Filter to only updown markets
+    updown_pattern = re.compile(r"^([a-z]+)-updown-(\d+[mh])-")
+    updown_markets: list[tuple[str, str, dict[str, Any]]] = []  # (asset, timeframe, market)
+
+    for m in markets:
+        slug = (m.get("slug") or "").lower()
+        match = updown_pattern.match(slug)
+        if not match:
+            # Also check question text as fallback
+            question = (m.get("question") or "").lower()
+            if "up or down" not in question:
+                continue
+            # Try to extract asset/timeframe from question
+            # e.g. "Bitcoin Up or Down - February 6, 9:15AM-9:30AM ET"
+            match = updown_pattern.match(slug)
+            if not match:
+                continue
+        asset = match.group(1)
+        timeframe = match.group(2)
+
+        # Step 2: Filter by requested asset
+        if requested_assets and asset not in requested_assets:
+            continue
+
+        # Filter by requested timeframe
+        if requested_timeframes and timeframe not in requested_timeframes:
+            continue
+
+        updown_markets.append((asset, timeframe, m))
+
+    # Step 3: Group by asset+timeframe, keep nearest-expiring
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for asset, timeframe, m in updown_markets:
+        key = f"{asset}-{timeframe}"
+        buckets.setdefault(key, []).append(m)
+
+    result: list[dict[str, Any]] = []
+    for key, group in buckets.items():
+        group.sort(key=lambda m: _parse_end_date(m) or datetime.max.replace(tzinfo=timezone.utc))
+        for m in group:
+            end_dt = _parse_end_date(m)
+            if end_dt and end_dt > now:
+                result.append(m)
+                break
+        else:
+            if group:
+                result.append(group[0])
+
+    return result
+
+
 def passes_filters(market: dict[str, Any]) -> bool:
     """Check if a market passes minimum liquidity/volume filters."""
     volume = float(market.get("volume", 0) or 0)
@@ -229,6 +335,12 @@ async def search_and_filter(
         for m in markets:
             if _should_include(m):
                 results.append(m)
+
+    # For short-term queries, filter to only the live up/down market per asset
+    if _is_short_term_query(terms):
+        filtered = _filter_short_term_markets(results, terms)
+        if filtered:
+            results = filtered
 
     # Sort by volume descending
     results.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)

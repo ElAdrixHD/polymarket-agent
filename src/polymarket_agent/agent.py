@@ -42,11 +42,30 @@ def print_markets(markets: list[dict]) -> None:
     console.print(table)
 
 
-async def run_once(strategy: LLMStrategy) -> None:
-    """Run one iteration of the agent loop."""
-    console.print("\n[bold]Scanning markets...[/bold]")
-    markets = await scan_markets(limit=50)
-    console.print(f"Found {len(markets)} markets passing filters")
+async def run_once(
+    strategy: LLMStrategy,
+    search_terms: list[str] | None = None,
+    max_hours: float | None = None,
+) -> None:
+    """Run one iteration of the agent loop.
+
+    If *search_terms* is given, re-search for the current live market(s)
+    matching those terms (so short-term markets auto-rotate to the next
+    live window).  Otherwise scan broadly.
+    """
+    if search_terms is not None:
+        console.print(f"\n[bold]Searching live market for: {', '.join(search_terms)}[/bold]")
+        markets = await gamma.search_and_filter(terms=search_terms, max_hours=max_hours)
+        if not markets:
+            console.print("[yellow]No live market found for this window. Waiting for next...[/yellow]")
+            return
+        console.print(f"Found {len(markets)} live market(s)")
+        for m in markets:
+            console.print(f"  • {m.get('question', '?')}")
+    else:
+        console.print("\n[bold]Scanning markets...[/bold]")
+        markets = await scan_markets(limit=50)
+        console.print(f"Found {len(markets)} markets passing filters")
 
     positions = []
     try:
@@ -85,6 +104,78 @@ async def run_once(strategy: LLMStrategy) -> None:
             console.print(f"  → [bold red]Trade failed:[/bold red] {exc}")
 
 
+class _SearchConfig:
+    """Holds the parsed search parameters so the loop can re-search each iteration."""
+
+    def __init__(self, terms: list[str], max_hours: float | None = None) -> None:
+        self.terms = terms
+        self.max_hours = max_hours
+
+
+async def _pick_markets() -> _SearchConfig | None:
+    """Ask the user what market to search for in natural language.
+
+    Returns a ``_SearchConfig`` with the parsed terms (so the loop can
+    re-search on every iteration and always find the current live market),
+    or *None* to scan all markets broadly.
+    """
+    from polymarket_agent.analyst.llm import parse_query
+
+    console.print(
+        "\n[bold]What market do you want to monitor?[/bold]"
+        "\n  Examples: [cyan]btc 15min[/cyan], [cyan]eth 1h[/cyan], [cyan]sol 5min[/cyan]"
+        "\n  or [bold]all[/bold] to scan everything"
+        "\n  or [bold]q[/bold] to quit"
+    )
+
+    query = input("\n> ").strip()
+
+    if not query:
+        return None
+    if query.lower() in ("q", "quit", "exit"):
+        return _SearchConfig(terms=[])  # empty terms = abort
+    if query.lower() == "all":
+        return None
+
+    console.print(f"\nInterpreting: [cyan]{query}[/cyan]")
+    parsed = await parse_query(query)
+    console.print(f"Search terms: [bold]{', '.join(parsed.search_terms)}[/bold]")
+
+    # Do an initial search to confirm results exist
+    console.print("Searching markets...")
+    markets = await gamma.search_and_filter(
+        terms=parsed.search_terms,
+        max_hours=parsed.max_hours,
+    )
+
+    if not markets:
+        console.print("[yellow]No markets found. Falling back to broad scan.[/yellow]")
+        return None
+
+    # Show what was found
+    table = Table(title=f"Found {len(markets)} market(s)")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Question", style="cyan", max_width=60)
+    table.add_column("Volume", justify="right", style="green")
+    table.add_column("End Date", style="yellow", max_width=20)
+
+    for i, m in enumerate(markets, 1):
+        table.add_row(
+            str(i),
+            m.get("question", "?")[:60],
+            f"${float(m.get('volume', 0) or 0):,.0f}",
+            str(m.get("endDate", "?"))[:20],
+        )
+    console.print(table)
+
+    console.print(
+        f"\n[green]Will monitor this search and auto-rotate to the next "
+        f"live window each iteration.[/green]"
+    )
+
+    return _SearchConfig(terms=parsed.search_terms, max_hours=parsed.max_hours)
+
+
 async def run_loop(risk_tolerance: str | None = None) -> None:
     """Run the agent in a continuous loop."""
     risk = risk_tolerance or settings.risk_tolerance
@@ -101,11 +192,20 @@ async def run_loop(risk_tolerance: str | None = None) -> None:
         console.print(f"[bold red]CLOB init failed:[/bold red] {exc}")
         console.print("Continuing in read-only mode...")
 
+    # Ask the user which market(s) to focus on
+    search_cfg = await _pick_markets()
+    if search_cfg is not None and len(search_cfg.terms) == 0:
+        console.print("[dim]Aborted.[/dim]")
+        return
+
     strategy = LLMStrategy(risk_tolerance=risk)
 
     while True:
         try:
-            await run_once(strategy)
+            if search_cfg is not None:
+                await run_once(strategy, search_terms=search_cfg.terms, max_hours=search_cfg.max_hours)
+            else:
+                await run_once(strategy)
         except Exception as exc:
             log.error("Agent loop error: %s", exc)
             console.print(f"[bold red]Error:[/bold red] {exc}")
