@@ -57,6 +57,12 @@ You will be given real market data to inform your decision:
 - **Market signals**: 1h and 24h price changes, spread, volume
 
 ## How to Use the Data
+- **Spot price (CRITICAL for Up/Down markets)**: For crypto up/down markets you will receive the \
+LIVE spot price from Binance and the market's reference price. This is your MOST IMPORTANT signal:
+  - If spot > reference → asset is UP → YES should win → BUY_YES
+  - If spot < reference → asset is DOWN → NO should win → BUY_NO
+  - The magnitude of the difference relative to time remaining determines confidence.
+  - **This is real external data, not market opinion. Trust it over order book sentiment.**
 - **Momentum**: If price has been trending up (series of higher prices), that suggests \
 YES is gaining. If trending down, NO side is gaining.
 - **Order book pressure**: bid_ask_ratio > 1 means more buying pressure (bullish for YES). \
@@ -73,6 +79,16 @@ have more mispricing opportunities.
   - If you previously said SKIP but prices have shifted significantly, re-evaluate.
   - Look for acceleration or deceleration in price changes across evaluations.
 
+## Existing Orders (Session Memory)
+If you have already placed orders on this market during this session:
+- **Do NOT duplicate** the same position unless the edge has grown significantly since \
+your last order (price moved further in your favor).
+- **Consider the total exposure**: your new order + existing orders should not over-expose \
+on a single market.
+- If the market moved against your previous order, be cautious — do not average down \
+unless you have very high confidence.
+- If the market moved in your favor, consider whether the edge is now too small to add more.
+
 ## Short-Term Markets (Up or Down)
 These are binary markets that resolve within minutes or hours. Key considerations:
 - **Time decay matters**: as resolution approaches, prices should converge to true probability fast.
@@ -80,6 +96,13 @@ These are binary markets that resolve within minutes or hours. Key consideration
 with even a small edge is better than missing it entirely.
 - **Momentum is king**: in short timeframes, recent price trends and order book pressure are the \
 strongest signals. Fundamentals matter less.
+- **NEVER fight the trend**: if price is dropping sharply (e.g. YES went from 0.50 → 0.20), that is \
+strong bearish momentum — do NOT buy YES thinking it's "undervalued" or "cheap". A falling price means \
+the market is repricing downward. Follow the momentum direction, not "value".
+- **A large price drop is NOT a buying opportunity**: if YES dropped 50%+ in minutes, that's a crash, \
+not a discount. The correct trade is BUY_NO (or SKIP), never BUY_YES against the trend.
+- **Use price history direction**: look at the TREND in price history, not individual price levels. \
+If the last N points show consistent decline, trade WITH that direction.
 - **Lower your edge threshold**: for markets expiring in < 30 minutes, an edge of 2 cents is actionable.
 
 ## Decision Framework
@@ -138,11 +161,14 @@ def build_analysis_prompt(
     price_history: list[dict] | None = None,
     orderbook_summary: dict | None = None,
     past_evaluations: list[dict] | None = None,
+    order_history: list[dict] | None = None,
+    spot_price_info: dict | None = None,
 ) -> str:
     """Build the user prompt for market analysis."""
     # Calculate time remaining
     now = datetime.now(timezone.utc)
     time_remaining_str = ""
+    total_seconds = 0.0
     if end_date and end_date != "unknown":
         try:
             # Parse ISO format end date
@@ -176,6 +202,74 @@ def build_analysis_prompt(
         f"**Liquidity:** ${liquidity:,.0f}",
         f"**End date:** {end_date}",
     ]
+
+    # Spot price context for up/down crypto markets
+    if spot_price_info:
+        parts.append(f"\n## Live {spot_price_info['asset']} Spot Price (from Binance)")
+        parts.append(f"- **Current spot price:** ${spot_price_info['spot_price']:,.2f}")
+        if spot_price_info.get("reference_price"):
+            ref = spot_price_info["reference_price"]
+            diff = spot_price_info.get("price_diff", 0)
+            pct = spot_price_info.get("price_diff_pct", 0)
+            parts.append(f"- **Market reference price:** ${ref:,.2f}")
+            parts.append(f"- **Difference:** ${diff:+,.2f} ({pct:+.3f}%)")
+            if diff > 0:
+                parts.append(f"- **Direction:** {spot_price_info['asset']} is ABOVE the reference → favors YES/Up")
+            elif diff < 0:
+                parts.append(f"- **Direction:** {spot_price_info['asset']} is BELOW the reference → favors NO/Down")
+            else:
+                parts.append(f"- **Direction:** {spot_price_info['asset']} is AT the reference → coin flip")
+
+    # Dynamic risk guidance based on time remaining + price movement
+    # Uses dollar-based volatility thresholds calibrated per asset.
+    # Typical BTC volatility: ~$50/min, ~$150/5min, ~$300/15min
+    # Typical ETH volatility: ~$5/min, ~$15/5min, ~$30/15min
+    _VOLATILITY_PER_MIN: dict[str, float] = {
+        "BTC": 50.0, "ETH": 5.0, "SOL": 0.20, "XRP": 0.002,
+    }
+
+    if spot_price_info and spot_price_info.get("price_diff") is not None and total_seconds > 0:
+        abs_diff = abs(spot_price_info["price_diff"])
+        diff = spot_price_info["price_diff"]
+        asset = spot_price_info["asset"]
+        mins_left = total_seconds / 60
+
+        # Expected volatility for the remaining time (scales with sqrt of time)
+        vol_per_min = _VOLATILITY_PER_MIN.get(asset, 50.0)
+        expected_swing = vol_per_min * (mins_left ** 0.5)
+
+        # How many "expected swings" is the current move?
+        # >2x = very strong, 1-2x = solid, 0.5-1x = moderate, <0.5x = noise
+        strength = abs_diff / expected_swing if expected_swing > 0 else 0
+
+        parts.append(f"\n## Dynamic Risk Assessment")
+        parts.append(f"- **Price move:** ${diff:+,.2f} from reference")
+        parts.append(f"- **Expected {asset} swing in {mins_left:.0f}min:** ~${expected_swing:,.0f}")
+        parts.append(f"- **Signal strength:** {strength:.1f}x expected volatility")
+
+        if strength >= 2.0:
+            parts.append(
+                f"- **RISK: LOW** — Move is {strength:.1f}x the expected swing. "
+                f"Very strong signal. {asset} would need an extraordinary reversal "
+                f"of ${abs_diff:,.0f} in {mins_left:.0f}min to flip. High confidence trade."
+            )
+        elif strength >= 1.0:
+            parts.append(
+                f"- **RISK: LOW-MODERATE** — Move is {strength:.1f}x the expected swing. "
+                f"Solid signal. Reversal is possible but unlikely in {mins_left:.0f}min. "
+                f"Trade with good confidence."
+            )
+        elif strength >= 0.5:
+            parts.append(
+                f"- **RISK: MODERATE** — Move is only {strength:.1f}x the expected swing. "
+                f"The current direction could easily reverse. Trade with caution, smaller size."
+            )
+        else:
+            parts.append(
+                f"- **RISK: HIGH** — Move is only {strength:.1f}x the expected swing. "
+                f"This is within normal noise for {asset}. Essentially a coin flip. "
+                f"Prefer SKIP unless other signals are very strong."
+            )
 
     # Enriched market signals from Gamma
     if market_signals:
@@ -231,6 +325,17 @@ def build_analysis_prompt(
                 f"(conf={ev.get('confidence', '?'):.0%}, "
                 f"est_prob={ev.get('estimated_probability', '?'):.0%}) "
                 f"| {ev.get('reasoning', '')}"
+            )
+
+    if order_history:
+        parts.append(f"\n## Orders Placed This Session ({len(order_history)} orders)")
+        parts.append("You have already placed these orders on this market:")
+        for i, order in enumerate(order_history, 1):
+            parts.append(
+                f"  {i}. [{order.get('timestamp', '?')}] "
+                f"{order.get('action', '?')} "
+                f"size={order.get('size', '?')} "
+                f"price={order.get('price', '?')}"
             )
 
     if positions:

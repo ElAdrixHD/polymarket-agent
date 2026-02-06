@@ -60,8 +60,8 @@ class LLMStrategy:
             logger.warning("No token_id found for %s", analysis.recommendation)
             return None
 
-        # Determine size (capped by max bet, floored by Polymarket minimum)
-        MIN_ORDER_USDC = 1.0
+        # Determine size (capped by max bet, floored by Polymarket minimum of 5 shares)
+        MIN_ORDER_SIZE = 5.0
         size = min(
             analysis.suggested_size or settings.max_bet_usdc,
             settings.max_bet_usdc,
@@ -72,19 +72,17 @@ class LLMStrategy:
         if price is None:
             price = 0.5
 
-        # Ensure minimum order value ($1 on Polymarket)
-        if size * price < MIN_ORDER_USDC:
-            size = MIN_ORDER_USDC / price
+        # Ensure minimum order size (5 shares on Polymarket)
+        if size < MIN_ORDER_SIZE:
+            size = MIN_ORDER_SIZE
 
         # Check available cash balance
         available = clob.get_balance()
-        if available < MIN_ORDER_USDC:
-            logger.info("Skipping: available balance $%.2f too low", available)
-            return None
-        if size * price > available:
-            size = available / price
+        if available < size * price:
+            size = available / price if price > 0 else 0
             logger.info("Capped size to %.1f based on $%.2f available", size, available)
-            if size * price < MIN_ORDER_USDC:
+            if size < MIN_ORDER_SIZE:
+                logger.info("Skipping: size %.1f < minimum %s after balance cap", size, MIN_ORDER_SIZE)
                 return None
 
         # Check portfolio exposure
@@ -93,8 +91,8 @@ class LLMStrategy:
             for p in positions
         )
         if current_exposure + (size * price) > settings.max_portfolio_usdc:
-            size = max(0, (settings.max_portfolio_usdc - current_exposure) / price)
-            if size * price < MIN_ORDER_USDC:
+            size = max(0, (settings.max_portfolio_usdc - current_exposure) / price) if price > 0 else 0
+            if size < MIN_ORDER_SIZE:
                 return None
 
         return TradeSignal(

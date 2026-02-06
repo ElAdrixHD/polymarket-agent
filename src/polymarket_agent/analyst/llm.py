@@ -27,6 +27,34 @@ logger = logging.getLogger(__name__)
 MAX_HISTORY = 5
 _evaluation_history: dict[str, deque[dict[str, Any]]] = {}
 
+# ---------------------------------------------------------------------------
+# Order history: tracks orders placed this session so the LLM can avoid
+# duplicate positions and adjust sizing on repeated evaluations.
+# ---------------------------------------------------------------------------
+_order_history: dict[str, list[dict[str, Any]]] = {}
+
+
+def record_order(
+    market_key: str,
+    action: str,
+    token_id: str,
+    size: float,
+    price: float,
+) -> None:
+    """Record a successfully placed order for future LLM context."""
+    _order_history.setdefault(market_key, []).append({
+        "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+        "action": action,
+        "token_id": token_id[:20] + "...",
+        "size": size,
+        "price": price,
+    })
+
+
+def get_order_history(market_key: str) -> list[dict[str, Any]]:
+    """Return orders placed this session for a given market."""
+    return _order_history.get(market_key, [])
+
 
 class ParsedQuery(BaseModel):
     search_terms: list[str]
@@ -286,6 +314,48 @@ async def analyze_market(
     market_key = market.get("conditionId") or market.get("condition_id") or market.get("question", "")
     past_evals = list(_evaluation_history.get(market_key, []))
 
+    past_orders = get_order_history(market_key)
+
+    # Remove stale Gamma price fields when we have live CLOB data to avoid
+    # confusing the LLM with conflicting prices.
+    if orderbook_summary:
+        for stale_key in ("best_bid", "best_ask", "spread", "last_trade_price", "outcome_prices"):
+            market_signals.pop(stale_key, None)
+
+    # --- Fetch real crypto spot price for up/down markets ---
+    from polymarket_agent.crypto_prices import (
+        extract_asset_from_slug,
+        get_price_at_time,
+        get_spot_price,
+        parse_event_start_time,
+    )
+
+    spot_price_info: dict[str, Any] | None = None
+    slug = market.get("slug", "")
+    asset = extract_asset_from_slug(slug)
+    if asset:
+        spot = await get_spot_price(asset)
+        # Get the reference price (BTC price at the start of the window)
+        ref_price: float | None = None
+        start_ts = parse_event_start_time(market)
+        if start_ts:
+            ref_price = await get_price_at_time(asset, start_ts)
+
+        if spot is not None:
+            spot_price_info = {
+                "asset": asset.upper(),
+                "spot_price": spot,
+                "reference_price": ref_price,
+                "price_diff": round(spot - ref_price, 2) if ref_price else None,
+                "price_diff_pct": round((spot - ref_price) / ref_price * 100, 3) if ref_price else None,
+            }
+            logger.info(
+                "Spot price for %s: $%.2f, reference: %s, diff: %s",
+                asset.upper(), spot,
+                f"${ref_price:,.2f}" if ref_price else "N/A",
+                f"${spot_price_info['price_diff']:+.2f}" if spot_price_info.get("price_diff") is not None else "N/A",
+            )
+
     prompt = build_analysis_prompt(
         question=market.get("question", ""),
         description=market.get("description", ""),
@@ -299,6 +369,8 @@ async def analyze_market(
         price_history=price_history,
         orderbook_summary=orderbook_summary,
         past_evaluations=past_evals,
+        order_history=past_orders,
+        spot_price_info=spot_price_info,
     )
 
     system = build_system_prompt(risk_tolerance or settings.risk_tolerance)

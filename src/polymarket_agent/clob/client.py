@@ -24,7 +24,8 @@ def _get_client() -> ClobClient:
             settings.clob_api_url,
             key=settings.private_key,
             chain_id=settings.chain_id,
-            signature_type=0,  # EOA wallet
+            signature_type=2,  # POLY_PROXY (Polymarket UI wallet)
+            funder=settings.proxy_address or None,
         )
     return _client
 
@@ -62,8 +63,11 @@ def _get_initialized_client() -> ClobClient:
 def get_balance() -> float:
     """Get available USDC balance from the CLOB."""
     try:
-        client = _get_initialized_client()
-        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        client = init()
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=2,  # Match proxy wallet type
+        )
         resp = client.get_balance_allowance(params)
         raw = float(resp.get("balance", 0) or 0)
         # API returns raw USDC units (6 decimals)
@@ -135,11 +139,17 @@ def sell(token_id: str, price: float, size: float) -> dict[str, Any]:
     return client.post_order(signed, OrderType.GTC)
 
 
-def market_buy(token_id: str, amount: float) -> dict[str, Any]:
-    """Place a FOK market buy order."""
+def market_buy(token_id: str, amount: float, max_price: float = 0.99) -> dict[str, Any]:
+    """Place a FOK market buy order.
+
+    *max_price* is the ceiling price — the order will only fill if the
+    available price is at or below this value.  Defaults to 0.99 (max).
+    """
     client = _get_client()
+    # Clamp to valid Polymarket range
+    price = max(0.01, min(max_price, 0.99))
     order_args = OrderArgs(
-        price=1.0,
+        price=price,
         size=amount,
         side="BUY",
         token_id=token_id,

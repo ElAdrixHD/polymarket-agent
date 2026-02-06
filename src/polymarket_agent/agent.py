@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from rich.console import Console
 from rich.table import Table
 
+from polymarket_agent.analyst.llm import get_order_history, record_order
+from polymarket_agent.crypto_prices import extract_asset_from_slug, parse_event_start_time
 from polymarket_agent.clob import client as clob
 from polymarket_agent.config import settings
 from polymarket_agent.data import client as data
@@ -73,10 +76,46 @@ async def run_once(
     except Exception as exc:
         log.warning("Could not fetch positions: %s", exc)
 
+    # Minimum % of window that must have elapsed before trading (by risk level)
+    _MIN_ELAPSED_PCT: dict[str, float] = {
+        "conservative": 0.60,  # wait until 60% of window elapsed
+        "moderate": 0.40,      # wait until 40% of window elapsed
+        "aggressive": 0.15,    # wait until 15% of window elapsed
+    }
+
     for market in markets:
         question = market.get("question", "?")
         slug = market.get("slug", "")
         console.print(f"\n[bold blue]Evaluating:[/bold blue] {question}")
+
+        # Time guard for short-term markets: don't trade too early in the window
+        if extract_asset_from_slug(slug):
+            start_ts = parse_event_start_time(market)
+            end_date = market.get("endDate", "")
+            if start_ts and end_date:
+                try:
+                    end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    start_dt = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc)
+                    now = datetime.now(timezone.utc)
+                    window_secs = (end_dt - start_dt).total_seconds()
+                    elapsed_secs = (now - start_dt).total_seconds()
+
+                    if window_secs > 0 and elapsed_secs >= 0:
+                        elapsed_pct = elapsed_secs / window_secs
+                        risk = strategy.risk_tolerance or settings.risk_tolerance
+                        min_pct = _MIN_ELAPSED_PCT.get(risk, 0.40)
+
+                        if elapsed_pct < min_pct:
+                            mins_elapsed = elapsed_secs / 60
+                            mins_total = window_secs / 60
+                            console.print(
+                                f"  → [bold yellow]TOO EARLY:[/bold yellow] "
+                                f"{mins_elapsed:.0f}m/{mins_total:.0f}m elapsed "
+                                f"({elapsed_pct:.0%} < {min_pct:.0%} required for {risk} risk). Waiting."
+                            )
+                            continue
+                except (ValueError, TypeError):
+                    pass
 
         try:
             signal = await strategy.evaluate(market, positions)
@@ -90,15 +129,34 @@ async def run_once(
 
         console.print(
             f"  → [bold green]{signal.action}[/bold green] "
-            f"price={signal.price:.2f} size={signal.size:.1f} "
-            f"confidence={signal.confidence:.0%}"
+            f"price={signal.price:.2f} max={round(signal.price + 0.03, 2):.2f} "
+            f"size={signal.size:.1f} confidence={signal.confidence:.0%}"
         )
         console.print(f"    Reasoning: {signal.reasoning[:120]}")
 
-        # Execute trade
+        # Hard guard: skip if we already have an order on this market this session
+        market_key = market.get("conditionId") or market.get("condition_id") or market.get("question", "")
+        past_orders = get_order_history(market_key)
+        if past_orders:
+            console.print(
+                f"  → [bold yellow]BLOCKED:[/bold yellow] Already placed "
+                f"{len(past_orders)} order(s) on this market this session. Skipping."
+            )
+            continue
+
+        # Execute trade (market order — FOK with price ceiling)
+        # Allow up to 3 cents of slippage above the LLM's suggested price
+        max_price = round(signal.price + 0.03, 2)
         try:
-            result = clob.buy(signal.token_id, signal.price, signal.size)
+            result = clob.market_buy(signal.token_id, signal.size, max_price=max_price)
             console.print(f"  → [bold green]Order placed:[/bold green] {result}")
+            record_order(
+                market_key=market_key,
+                action=signal.action,
+                token_id=signal.token_id,
+                size=signal.size,
+                price=signal.price,
+            )
         except Exception as exc:
             log.error("Trade failed for %s: %s", slug, exc)
             console.print(f"  → [bold red]Trade failed:[/bold red] {exc}")

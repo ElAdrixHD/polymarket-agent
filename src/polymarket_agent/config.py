@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # Wallet
     private_key: str = ""
     wallet_address: str = ""
+    proxy_address: str = ""  # Polymarket proxy wallet (funder) address
 
     # LLM
     llm_provider: Literal["openai", "anthropic"] = "openai"
