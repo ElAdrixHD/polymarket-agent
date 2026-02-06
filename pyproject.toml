@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "polymarket-agent"
+version = "0.1.0"
+description = "Autonomous trading agent for Polymarket prediction markets"
+requires-python = ">=3.11"
+dependencies = [
+    "py-clob-client>=0.5",
+    "httpx>=0.27",
+    "pydantic-settings>=2.0",
+    "openai>=1.0",
+    "anthropic>=0.40",
+    "rich>=13.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+polymarket-agent = "polymarket_agent.cli:main"
