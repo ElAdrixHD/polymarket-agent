@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -230,12 +230,16 @@ def _filter_short_term_markets(
         key = f"{asset}-{timeframe}"
         buckets.setdefault(key, []).append(m)
 
+    # Skip markets closing within this buffer — they're about to end,
+    # pick the next window instead.
+    min_remaining = timedelta(minutes=2)
+
     result: list[dict[str, Any]] = []
     for key, group in buckets.items():
         group.sort(key=lambda m: _parse_end_date(m) or datetime.max.replace(tzinfo=timezone.utc))
         for m in group:
             end_dt = _parse_end_date(m)
-            if end_dt and end_dt > now:
+            if end_dt and end_dt > now + min_remaining:
                 result.append(m)
                 break
         else:
@@ -345,3 +349,30 @@ async def search_and_filter(
     # Sort by volume descending
     results.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
     return results
+
+
+def extract_market_signals(market: dict[str, Any]) -> dict[str, Any]:
+    """Extract enriched trading signals from a Gamma market response."""
+    def _f(key: str, default: float = 0.0) -> float:
+        val = market.get(key)
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    best_bid = _f("bestBid")
+    best_ask = _f("bestAsk")
+    spread = _f("spread", best_ask - best_bid if best_ask and best_bid else 0.0)
+
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "spread": round(spread, 4),
+        "last_trade_price": _f("lastTradePrice"),
+        "one_hour_change": _f("oneHourPriceChange"),
+        "one_day_change": _f("oneDayPriceChange"),
+        "volume_24h": _f("volume24hr"),
+        "outcome_prices": market.get("outcomePrices", market.get("outcome_prices", "")),
+    }

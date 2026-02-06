@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+import httpx
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, OrderArgs, OrderType
 
 from polymarket_agent.config import settings
 
+logger = logging.getLogger(__name__)
+
 _client: ClobClient | None = None
+_initialized: bool = False
 
 
 def _get_client() -> ClobClient:
@@ -25,21 +30,82 @@ def _get_client() -> ClobClient:
 
 
 def init() -> ClobClient:
-    """Initialize and return the CLOB client."""
+    """Initialize and return the CLOB client with API creds."""
+    global _initialized
     client = _get_client()
-    client.set_api_creds(client.create_or_derive_api_creds())
+    if not _initialized:
+        client.set_api_creds(client.create_or_derive_api_creds())
+        # Refresh server-side allowance tracking
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            client.update_balance_allowance(params)
+            logger.info("Balance/allowance refreshed on CLOB server")
+        except Exception as exc:
+            logger.warning("Failed to refresh balance/allowance: %s", exc)
+        _initialized = True
     return client
 
 
-def get_price(token_id: str) -> dict[str, Any]:
-    """Get current price for a token."""
+def _get_initialized_client() -> ClobClient:
+    """Get a client that has API creds set up (needed for orderbook etc)."""
+    global _initialized
     client = _get_client()
-    return client.get_price(token_id)
+    if not _initialized and settings.private_key:
+        try:
+            client.set_api_creds(client.create_or_derive_api_creds())
+            _initialized = True
+        except Exception as exc:
+            logger.warning("Failed to initialize CLOB API creds: %s", exc)
+    return client
+
+
+def get_balance() -> float:
+    """Get available USDC balance from the CLOB."""
+    try:
+        client = _get_initialized_client()
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        resp = client.get_balance_allowance(params)
+        raw = float(resp.get("balance", 0) or 0)
+        # API returns raw USDC units (6 decimals)
+        balance = raw / 1e6 if raw > 1_000 else raw
+        logger.info("CLOB balance response: raw=%s parsed=$%.2f", raw, balance)
+        return balance
+    except Exception as exc:
+        logger.warning("Failed to get balance: %s", exc)
+        return 0.0
+
+
+def get_price(token_id: str, side: str = "BUY") -> dict[str, Any]:
+    """Get current price for a token (requires side: BUY or SELL)."""
+    client = _get_client()
+    return client.get_price(token_id, side)
+
+
+def get_midpoint(token_id: str) -> float:
+    """Get the midpoint price for a token. Returns 0.0 on failure."""
+    try:
+        client = _get_client()
+        resp = client.get_midpoint(token_id)
+        return float(resp.get("mid", 0) or 0)
+    except Exception as exc:
+        logger.warning("Failed to get midpoint for %s: %s", token_id[:20], exc)
+        return 0.0
+
+
+def get_last_trade_price(token_id: str) -> float:
+    """Get the last trade price for a token. Returns 0.0 on failure."""
+    try:
+        client = _get_client()
+        resp = client.get_last_trade_price(token_id)
+        return float(resp.get("price", 0) or 0)
+    except Exception as exc:
+        logger.warning("Failed to get last trade price for %s: %s", token_id[:20], exc)
+        return 0.0
 
 
 def get_orderbook(token_id: str) -> dict[str, Any]:
     """Get the order book for a token."""
-    client = _get_client()
+    client = _get_initialized_client()
     return client.get_order_book(token_id)
 
 
@@ -92,3 +158,68 @@ def cancel_all() -> list[Any]:
     """Cancel all open orders."""
     client = _get_client()
     return client.cancel_all()
+
+
+async def get_price_history(
+    token_id: str,
+    interval: str = "1h",
+    fidelity: int = 5,
+) -> list[dict[str, Any]]:
+    """Fetch recent price history from the CLOB prices-history endpoint.
+
+    Returns a list of ``{t, p}`` dicts (timestamp, price).
+    """
+    url = f"{settings.clob_api_url}/prices-history"
+    params = {"market": token_id, "interval": interval, "fidelity": fidelity}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            return resp.json().get("history", [])
+    except Exception as exc:
+        logger.warning("Failed to fetch price history: %s", exc)
+        return []
+
+
+def get_orderbook_summary(token_id: str) -> dict[str, Any]:
+    """Get a compact summary of the current order book.
+
+    Returns bid_depth, ask_depth, spread, midpoint, and bid/ask ratio.
+    """
+    try:
+        book = get_orderbook(token_id)
+        # Handle both dict and OrderBookSummary object
+        if hasattr(book, "bids"):
+            bids = book.bids or []
+            asks = book.asks or []
+        else:
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+
+        def _get(entry: Any, key: str, default: float = 0.0) -> float:
+            if hasattr(entry, key):
+                return float(getattr(entry, key, default))
+            return float(entry.get(key, default)) if isinstance(entry, dict) else default
+
+        bid_depth = sum(_get(o, "size") for o in bids)
+        ask_depth = sum(_get(o, "size") for o in asks)
+
+        best_bid = _get(bids[0], "price") if bids else 0.0
+        best_ask = _get(asks[0], "price") if asks else 1.0
+
+        spread = best_ask - best_bid
+        midpoint = (best_bid + best_ask) / 2 if (best_bid + best_ask) else 0.5
+        ratio = bid_depth / ask_depth if ask_depth else float("inf")
+
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "spread": round(spread, 4),
+            "midpoint": round(midpoint, 4),
+            "bid_depth": round(bid_depth, 2),
+            "ask_depth": round(ask_depth, 2),
+            "bid_ask_ratio": round(ratio, 3),
+        }
+    except Exception as exc:
+        logger.warning("Failed to get orderbook summary: %s", exc)
+        return {}

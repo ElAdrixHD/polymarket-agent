@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from polymarket_agent.analyst.llm import analyze_market
+from polymarket_agent.analyst.llm import analyze_market, extract_token_ids
+from polymarket_agent.clob import client as clob
 from polymarket_agent.config import settings
 from polymarket_agent.strategies.base import TradeSignal
+
+logger = logging.getLogger(__name__)
 
 
 class LLMStrategy:
@@ -22,26 +26,42 @@ class LLMStrategy:
     ) -> TradeSignal | None:
         analysis = await analyze_market(market, positions, risk_tolerance=self.risk_tolerance)
 
+        logger.info(
+            "LLM analysis for '%s': recommendation=%s confidence=%.2f "
+            "est_prob=%.2f reasoning=%s",
+            market.get("question", "?")[:60],
+            analysis.recommendation,
+            analysis.confidence,
+            analysis.estimated_probability,
+            analysis.reasoning,
+        )
+
         if analysis.recommendation == "SKIP":
             return None
 
         if analysis.confidence < settings.min_confidence:
+            logger.info(
+                "Skipping: confidence %.2f < min %.2f",
+                analysis.confidence,
+                settings.min_confidence,
+            )
             return None
 
         # Determine token ID based on recommendation
-        tokens = market.get("tokens", [])
-        token_id = ""
-        for tok in tokens:
-            outcome = tok.get("outcome", "").upper()
-            if analysis.recommendation == "BUY_YES" and outcome == "YES":
-                token_id = tok.get("token_id", "")
-            elif analysis.recommendation == "BUY_NO" and outcome == "NO":
-                token_id = tok.get("token_id", "")
+        token_ids = extract_token_ids(market)
+        if analysis.recommendation == "BUY_YES":
+            token_id = token_ids.get("YES", "")
+        elif analysis.recommendation == "BUY_NO":
+            token_id = token_ids.get("NO", "")
+        else:
+            token_id = ""
 
         if not token_id:
+            logger.warning("No token_id found for %s", analysis.recommendation)
             return None
 
-        # Determine size (capped by max bet)
+        # Determine size (capped by max bet, floored by Polymarket minimum)
+        MIN_ORDER_USDC = 1.0
         size = min(
             analysis.suggested_size or settings.max_bet_usdc,
             settings.max_bet_usdc,
@@ -50,12 +70,22 @@ class LLMStrategy:
         # Determine price
         price = analysis.suggested_price
         if price is None:
-            for tok in tokens:
-                if tok.get("token_id") == token_id:
-                    price = float(tok.get("price", 0.5))
-                    break
-            else:
-                price = 0.5
+            price = 0.5
+
+        # Ensure minimum order value ($1 on Polymarket)
+        if size * price < MIN_ORDER_USDC:
+            size = MIN_ORDER_USDC / price
+
+        # Check available cash balance
+        available = clob.get_balance()
+        if available < MIN_ORDER_USDC:
+            logger.info("Skipping: available balance $%.2f too low", available)
+            return None
+        if size * price > available:
+            size = available / price
+            logger.info("Capped size to %.1f based on $%.2f available", size, available)
+            if size * price < MIN_ORDER_USDC:
+                return None
 
         # Check portfolio exposure
         current_exposure = sum(
@@ -64,7 +94,7 @@ class LLMStrategy:
         )
         if current_exposure + (size * price) > settings.max_portfolio_usdc:
             size = max(0, (settings.max_portfolio_usdc - current_exposure) / price)
-            if size < 1:
+            if size * price < MIN_ORDER_USDC:
                 return None
 
         return TradeSignal(

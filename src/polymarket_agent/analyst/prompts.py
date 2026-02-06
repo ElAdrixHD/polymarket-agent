@@ -1,5 +1,7 @@
 """Prompt templates for LLM market analysis."""
 
+from datetime import datetime, timezone
+
 QUERY_SYSTEM_PROMPT = """\
 You are a query interpreter for a Polymarket prediction market agent.
 The user will ask you to find or analyze specific markets in natural language.
@@ -39,18 +41,60 @@ Respond with JSON only.\
 """
 
 SYSTEM_PROMPT = """\
-You are an expert prediction market analyst. Your job is to evaluate Polymarket \
-prediction markets and recommend whether to buy YES tokens, buy NO tokens, or skip.
+You are an expert prediction market analyst and short-term trader. Your job is to \
+evaluate Polymarket prediction markets and recommend whether to buy YES tokens, \
+buy NO tokens, or skip.
+
+**CURRENT TIME: {current_time} UTC**
 
 You must be calibrated: if you think the true probability is 60%, and YES trades at \
 50 cents, that's a BUY_YES. If YES trades at 70 cents, that's a BUY_NO (or SKIP).
 
-Always respond with valid JSON matching this schema:
+## Trading Signals You Will Receive
+You will be given real market data to inform your decision:
+- **Price history**: recent price points showing the trend/momentum
+- **Order book summary**: bid/ask depth and ratio indicating buying/selling pressure
+- **Market signals**: 1h and 24h price changes, spread, volume
+
+## How to Use the Data
+- **Momentum**: If price has been trending up (series of higher prices), that suggests \
+YES is gaining. If trending down, NO side is gaining.
+- **Order book pressure**: bid_ask_ratio > 1 means more buying pressure (bullish for YES). \
+ratio < 1 means more selling pressure (bearish for YES).
+- **Spread**: A tight spread means the market is liquid and prices are reliable. \
+A wide spread means less certainty.
+- **Volume**: Higher volume means more information is priced in. Low volume markets may \
+have more mispricing opportunities.
+- **Price changes**: 1h and 24h changes show recent momentum direction and magnitude.
+- **Past evaluations**: You may receive your own previous analyses for this market \
+(from prior evaluation cycles). Use them to track how the market has evolved:
+  - If the price is moving toward your estimated probability, your thesis is confirmed.
+  - If the price moved away, reconsider your thesis.
+  - If you previously said SKIP but prices have shifted significantly, re-evaluate.
+  - Look for acceleration or deceleration in price changes across evaluations.
+
+## Short-Term Markets (Up or Down)
+These are binary markets that resolve within minutes or hours. Key considerations:
+- **Time decay matters**: as resolution approaches, prices should converge to true probability fast.
+- **SKIP = guaranteed loss of opportunity**: these markets expire quickly, so being in the market \
+with even a small edge is better than missing it entirely.
+- **Momentum is king**: in short timeframes, recent price trends and order book pressure are the \
+strongest signals. Fundamentals matter less.
+- **Lower your edge threshold**: for markets expiring in < 30 minutes, an edge of 2 cents is actionable.
+
+## Decision Framework
+1. Look at the price trend — is there clear momentum in one direction?
+2. Check order book pressure — does it confirm or contradict the trend?
+3. Estimate the true probability based on all available signals
+4. Compare to current price to find edges >= 3 cents (2 cents for short-term markets)
+5. Only SKIP if you truly cannot form an opinion or the edge is < 2 cents
+
+Always respond with ONLY valid JSON (no markdown, no extra text) matching this schema:
 {
   "recommendation": "BUY_YES" | "BUY_NO" | "SKIP",
   "confidence": 0.0 to 1.0,
   "estimated_probability": 0.0 to 1.0,
-  "reasoning": "string",
+  "reasoning": "short explanation, max 2 sentences",
   "suggested_price": 0.0 to 1.0 or null,
   "suggested_size": number or null
 }
@@ -75,7 +119,8 @@ RISK_INSTRUCTIONS = {
 
 def build_system_prompt(risk_tolerance: str) -> str:
     """Build the full system prompt including risk instructions."""
-    base = SYSTEM_PROMPT
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    base = SYSTEM_PROMPT.replace("{current_time}", now)
     risk_block = RISK_INSTRUCTIONS["_default"].format(risk_tolerance=risk_tolerance)
     return base + risk_block
 
@@ -89,18 +134,104 @@ def build_analysis_prompt(
     liquidity: float,
     end_date: str,
     positions: list[dict] | None = None,
+    market_signals: dict | None = None,
+    price_history: list[dict] | None = None,
+    orderbook_summary: dict | None = None,
+    past_evaluations: list[dict] | None = None,
 ) -> str:
     """Build the user prompt for market analysis."""
+    # Calculate time remaining
+    now = datetime.now(timezone.utc)
+    time_remaining_str = ""
+    if end_date and end_date != "unknown":
+        try:
+            # Parse ISO format end date
+            end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            remaining = end_dt - now
+            total_seconds = remaining.total_seconds()
+            if total_seconds <= 0:
+                time_remaining_str = "**EXPIRED**"
+            elif total_seconds < 60:
+                time_remaining_str = f"**Time remaining:** {int(total_seconds)}s"
+            elif total_seconds < 3600:
+                time_remaining_str = f"**Time remaining:** {int(total_seconds // 60)}m {int(total_seconds % 60)}s"
+            elif total_seconds < 86400:
+                hours = int(total_seconds // 3600)
+                mins = int((total_seconds % 3600) // 60)
+                time_remaining_str = f"**Time remaining:** {hours}h {mins}m"
+            else:
+                days = int(total_seconds // 86400)
+                time_remaining_str = f"**Time remaining:** {days} days"
+        except (ValueError, TypeError):
+            pass
+
     parts = [
         f"## Market Analysis Request",
         f"**Question:** {question}",
         f"**Description:** {description}" if description else "",
+        time_remaining_str,
         f"**Current YES price:** ${yes_price:.2f}",
         f"**Current NO price:** ${no_price:.2f}",
         f"**Volume:** ${volume:,.0f}",
         f"**Liquidity:** ${liquidity:,.0f}",
         f"**End date:** {end_date}",
     ]
+
+    # Enriched market signals from Gamma
+    if market_signals:
+        parts.append("\n## Market Signals")
+        if market_signals.get("one_hour_change"):
+            parts.append(f"- 1h price change: {market_signals['one_hour_change']:+.4f}")
+        if market_signals.get("one_day_change"):
+            parts.append(f"- 24h price change: {market_signals['one_day_change']:+.4f}")
+        if market_signals.get("volume_24h"):
+            parts.append(f"- 24h volume: ${market_signals['volume_24h']:,.0f}")
+        if market_signals.get("spread"):
+            parts.append(f"- Spread: {market_signals['spread']:.4f}")
+        if market_signals.get("last_trade_price"):
+            parts.append(f"- Last trade price: {market_signals['last_trade_price']:.4f}")
+
+    # Recent price history
+    if price_history:
+        parts.append("\n## Recent Price History (oldest → newest)")
+        # Show up to last 12 points to avoid overwhelming the prompt
+        recent = price_history[-12:]
+        prices_str = ", ".join(f"{p.get('p', '?')}" for p in recent)
+        parts.append(f"Prices: [{prices_str}]")
+        # Show trend summary
+        if len(recent) >= 2:
+            first_p = float(recent[0].get("p", 0.5))
+            last_p = float(recent[-1].get("p", 0.5))
+            delta = last_p - first_p
+            direction = "UP" if delta > 0 else "DOWN" if delta < 0 else "FLAT"
+            parts.append(f"Trend: {direction} ({delta:+.4f} over {len(recent)} points)")
+
+    # Order book summary
+    if orderbook_summary:
+        parts.append("\n## Order Book Summary")
+        parts.append(f"- Best bid: {orderbook_summary.get('best_bid', '?')}")
+        parts.append(f"- Best ask: {orderbook_summary.get('best_ask', '?')}")
+        parts.append(f"- Spread: {orderbook_summary.get('spread', '?')}")
+        parts.append(f"- Bid depth: {orderbook_summary.get('bid_depth', '?')}")
+        parts.append(f"- Ask depth: {orderbook_summary.get('ask_depth', '?')}")
+        ratio = orderbook_summary.get("bid_ask_ratio")
+        if ratio is not None:
+            pressure = "BUYING pressure" if ratio > 1 else "SELLING pressure" if ratio < 1 else "NEUTRAL"
+            parts.append(f"- Bid/Ask ratio: {ratio:.3f} ({pressure})")
+
+    # Past evaluation history (agent memory across cycles)
+    if past_evaluations:
+        parts.append(f"\n## Your Previous Evaluations ({len(past_evaluations)} most recent)")
+        parts.append("Use these to track how the market and your assessment have evolved:")
+        for i, ev in enumerate(past_evaluations, 1):
+            parts.append(
+                f"  {i}. [{ev.get('timestamp', '?')}] "
+                f"YES=${ev.get('yes_price', '?'):.2f} NO=${ev.get('no_price', '?'):.2f} → "
+                f"{ev.get('recommendation', '?')} "
+                f"(conf={ev.get('confidence', '?'):.0%}, "
+                f"est_prob={ev.get('estimated_probability', '?'):.0%}) "
+                f"| {ev.get('reasoning', '')}"
+            )
 
     if positions:
         parts.append("\n## Current Portfolio Positions")
@@ -110,8 +241,9 @@ def build_analysis_prompt(
             parts.append(f"- {token}: {size} shares")
 
     parts.append(
-        "\nAnalyze this market. Consider current events, base rates, and whether "
-        "the price reflects the true probability. Respond with JSON only."
+        "\nAnalyze this market using ALL the data above — price trends, order book pressure, "
+        "and market signals. Identify any edge and make a concrete recommendation. "
+        "Respond with JSON only."
     )
 
     return "\n".join(p for p in parts if p)
