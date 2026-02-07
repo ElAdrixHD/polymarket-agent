@@ -163,6 +163,8 @@ def build_analysis_prompt(
     past_evaluations: list[dict] | None = None,
     order_history: list[dict] | None = None,
     spot_price_info: dict | None = None,
+    price_tracker_data: list[dict] | None = None,
+    reasoning_chain: list[dict] | None = None,
 ) -> str:
     """Build the user prompt for market analysis."""
     # Calculate time remaining
@@ -336,6 +338,41 @@ def build_analysis_prompt(
                 f"{order.get('action', '?')} "
                 f"size={order.get('size', '?')} "
                 f"price={order.get('price', '?')}"
+            )
+
+    # Accumulated spot price history from PriceTracker (30s intervals)
+    if price_tracker_data:
+        parts.append(f"\n## Accumulated Spot Price History ({len(price_tracker_data)} snapshots, 30s intervals)")
+        parts.append("Chronological price samples from Binance:")
+        for snap in price_tracker_data:
+            diff_str = ""
+            if snap.get("diff") is not None:
+                diff_str = f" | diff=${snap['diff']:+,.2f} ({snap.get('diff_pct', 0):+.3f}%)"
+            parts.append(
+                f"  [{snap.get('timestamp', '?')}] "
+                f"${snap['spot_price']:,.2f}"
+                f"{diff_str}"
+            )
+        # Quick trend summary
+        if len(price_tracker_data) >= 2:
+            first_s = price_tracker_data[0]["spot_price"]
+            last_s = price_tracker_data[-1]["spot_price"]
+            delta = last_s - first_s
+            pct = (delta / first_s * 100) if first_s else 0
+            direction = "UP" if delta > 0 else "DOWN" if delta < 0 else "FLAT"
+            parts.append(f"  **Trend:** {direction} ${delta:+,.2f} ({pct:+.3f}%) over {len(price_tracker_data)} samples")
+
+    # AI reasoning chain from prior analysis cycles
+    if reasoning_chain:
+        parts.append(f"\n## AI Reasoning Chain ({len(reasoning_chain)} prior analyses)")
+        parts.append("Your previous analyses of this market (use to build on your reasoning):")
+        for i, r in enumerate(reasoning_chain, 1):
+            spot_str = f" spot=${r['spot_price']:,.2f}" if r.get("spot_price") else ""
+            parts.append(
+                f"  {i}. [{r.get('timestamp', '?')}] "
+                f"{r.get('recommendation', '?')} "
+                f"(conf={r.get('confidence', 0):.0%}){spot_str}"
+                f"\n     Reasoning: {r.get('reasoning', '')}"
             )
 
     if positions:

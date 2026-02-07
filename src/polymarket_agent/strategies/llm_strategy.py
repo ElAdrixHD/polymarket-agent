@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from polymarket_agent.analyst.llm import analyze_market, extract_token_ids
+from polymarket_agent.analyst.llm import MarketAnalysis, analyze_market, extract_token_ids
 from polymarket_agent.clob import client as clob
 from polymarket_agent.config import settings
 from polymarket_agent.strategies.base import TradeSignal
@@ -23,8 +23,22 @@ class LLMStrategy:
         self,
         market: dict[str, Any],
         positions: list[dict[str, Any]],
-    ) -> TradeSignal | None:
-        analysis = await analyze_market(market, positions, risk_tolerance=self.risk_tolerance)
+        price_tracker_data: list[dict] | None = None,
+        reasoning_chain: list[dict] | None = None,
+    ) -> tuple[TradeSignal | None, MarketAnalysis]:
+        """Evaluate a market. Returns (signal, analysis).
+
+        The signal is None when the LLM says SKIP or confidence is below
+        ``MIN_CONFIDENCE``.  The raw analysis is always returned so the
+        caller can record reasoning regardless.
+        """
+        analysis = await analyze_market(
+            market,
+            positions,
+            risk_tolerance=self.risk_tolerance,
+            price_tracker_data=price_tracker_data,
+            reasoning_chain=reasoning_chain,
+        )
 
         logger.info(
             "LLM analysis for '%s': recommendation=%s confidence=%.2f "
@@ -37,7 +51,7 @@ class LLMStrategy:
         )
 
         if analysis.recommendation == "SKIP":
-            return None
+            return None, analysis
 
         if analysis.confidence < settings.min_confidence:
             logger.info(
@@ -45,7 +59,7 @@ class LLMStrategy:
                 analysis.confidence,
                 settings.min_confidence,
             )
-            return None
+            return None, analysis
 
         # Determine token ID based on recommendation
         token_ids = extract_token_ids(market)
@@ -58,7 +72,7 @@ class LLMStrategy:
 
         if not token_id:
             logger.warning("No token_id found for %s", analysis.recommendation)
-            return None
+            return None, analysis
 
         # Determine size (capped by max bet, floored by Polymarket minimum of 5 shares)
         MIN_ORDER_SIZE = 5.0
@@ -83,7 +97,7 @@ class LLMStrategy:
             logger.info("Capped size to %.1f based on $%.2f available", size, available)
             if size < MIN_ORDER_SIZE:
                 logger.info("Skipping: size %.1f < minimum %s after balance cap", size, MIN_ORDER_SIZE)
-                return None
+                return None, analysis
 
         # Check portfolio exposure
         current_exposure = sum(
@@ -93,7 +107,7 @@ class LLMStrategy:
         if current_exposure + (size * price) > settings.max_portfolio_usdc:
             size = max(0, (settings.max_portfolio_usdc - current_exposure) / price) if price > 0 else 0
             if size < MIN_ORDER_SIZE:
-                return None
+                return None, analysis
 
         return TradeSignal(
             action=analysis.recommendation,
@@ -102,4 +116,4 @@ class LLMStrategy:
             size=size,
             confidence=analysis.confidence,
             reasoning=analysis.reasoning,
-        )
+        ), analysis

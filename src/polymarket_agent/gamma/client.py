@@ -289,6 +289,18 @@ def expires_within_hours(market: dict[str, Any], max_hours: float) -> bool:
     return 0 < diff_hours <= max_hours
 
 
+# Canonical asset keywords for auto-expansion
+_ASSET_KEYWORDS: set[str] = {"btc", "bitcoin", "eth", "ethereum", "sol", "solana", "xrp"}
+_ALL_CRYPTO_ASSETS: list[str] = ["btc", "eth", "sol", "xrp"]
+
+
+def _should_auto_expand(terms: list[str]) -> bool:
+    """Return True if terms contain a timeframe keyword but NO asset keyword."""
+    has_timeframe = any(t.lower().strip() in _SHORT_TERM_KEYWORDS for t in terms)
+    has_asset = any(t.lower().strip() in _ASSET_KEYWORDS for t in terms)
+    return has_timeframe and not has_asset
+
+
 async def search_and_filter(
     terms: list[str],
     max_hours: float | None = None,
@@ -301,7 +313,12 @@ async def search_and_filter(
     2. Text-filter results to match the actual keywords
     3. Optionally filter by expiration time
     4. Deduplicate by market ID
+    5. If terms have a timeframe but no asset, auto-expand to all crypto assets
     """
+    # Auto-expand: if user said "15min" with no asset, search all assets
+    if _should_auto_expand(terms):
+        terms = terms + _ALL_CRYPTO_ASSETS
+
     seen_ids: set[str] = set()
     results: list[dict[str, Any]] = []
 

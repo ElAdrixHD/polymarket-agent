@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # the LLM can see how prices and its own assessments have evolved over time.
 # Key = market condition_id (or question hash as fallback).
 # ---------------------------------------------------------------------------
-MAX_HISTORY = 5
+MAX_HISTORY = 20
 _evaluation_history: dict[str, deque[dict[str, Any]]] = {}
 
 # ---------------------------------------------------------------------------
@@ -32,6 +32,12 @@ _evaluation_history: dict[str, deque[dict[str, Any]]] = {}
 # duplicate positions and adjust sizing on repeated evaluations.
 # ---------------------------------------------------------------------------
 _order_history: dict[str, list[dict[str, Any]]] = {}
+
+# ---------------------------------------------------------------------------
+# Reasoning chain: stores the full AI reasoning history per market so the
+# agent can build on its prior analysis across accumulation cycles.
+# ---------------------------------------------------------------------------
+_reasoning_history: dict[str, list[dict[str, Any]]] = {}
 
 
 def record_order(
@@ -54,6 +60,42 @@ def record_order(
 def get_order_history(market_key: str) -> list[dict[str, Any]]:
     """Return orders placed this session for a given market."""
     return _order_history.get(market_key, [])
+
+
+def record_reasoning(
+    market_key: str,
+    recommendation: str,
+    confidence: float,
+    reasoning: str,
+    spot_price: float | None = None,
+    reference_price: float | None = None,
+) -> None:
+    """Record an AI reasoning step for future context."""
+    _reasoning_history.setdefault(market_key, []).append({
+        "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "spot_price": spot_price,
+        "reference_price": reference_price,
+    })
+
+
+def get_reasoning_history(market_key: str) -> list[dict[str, Any]]:
+    """Return the full reasoning chain for a given market."""
+    return _reasoning_history.get(market_key, [])
+
+
+def clear_reasoning_history(market_key: str) -> None:
+    """Clear reasoning history for a market (used on window reset)."""
+    _reasoning_history.pop(market_key, None)
+
+
+def clear_all_window_state() -> None:
+    """Clear all per-window state (reasoning, orders, evaluations)."""
+    _reasoning_history.clear()
+    _order_history.clear()
+    _evaluation_history.clear()
 
 
 class ParsedQuery(BaseModel):
@@ -201,6 +243,8 @@ async def analyze_market(
     market: dict[str, Any],
     positions: list[dict] | None = None,
     risk_tolerance: str | None = None,
+    price_tracker_data: list[dict] | None = None,
+    reasoning_chain: list[dict] | None = None,
 ) -> MarketAnalysis:
     """Analyze a market and return a structured recommendation."""
     from polymarket_agent.clob.client import (
@@ -371,6 +415,8 @@ async def analyze_market(
         past_evaluations=past_evals,
         order_history=past_orders,
         spot_price_info=spot_price_info,
+        price_tracker_data=price_tracker_data,
+        reasoning_chain=reasoning_chain,
     )
 
     system = build_system_prompt(risk_tolerance or settings.risk_tolerance)

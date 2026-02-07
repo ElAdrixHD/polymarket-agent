@@ -1,4 +1,4 @@
-"""Main autonomous agent loop."""
+"""Main autonomous agent loop with multi-asset price accumulation."""
 
 from __future__ import annotations
 
@@ -9,8 +9,19 @@ from datetime import datetime, timezone
 from rich.console import Console
 from rich.table import Table
 
-from polymarket_agent.analyst.llm import get_order_history, record_order
-from polymarket_agent.crypto_prices import extract_asset_from_slug, parse_event_start_time
+from polymarket_agent.analyst.llm import (
+    clear_all_window_state,
+    get_order_history,
+    get_reasoning_history,
+    record_order,
+    record_reasoning,
+)
+from polymarket_agent.crypto_prices import (
+    PriceTracker,
+    extract_asset_from_slug,
+    get_spot_price,
+    parse_event_start_time,
+)
 from polymarket_agent.clob import client as clob
 from polymarket_agent.config import settings
 from polymarket_agent.data import client as data
@@ -19,6 +30,17 @@ from polymarket_agent.strategies.llm_strategy import LLMStrategy
 
 log = logging.getLogger(__name__)
 console = Console()
+
+# Interval constants (seconds)
+PRICE_SAMPLE_INTERVAL = 30
+ANALYSIS_INTERVAL = 60
+
+# Minimum % of window that must have elapsed before analysis (by risk level)
+_MIN_ELAPSED_PCT: dict[str, float] = {
+    "conservative": 0.60,
+    "moderate": 0.40,
+    "aggressive": 0.15,
+}
 
 
 async def scan_markets(limit: int = 20) -> list[dict]:
@@ -45,121 +67,257 @@ def print_markets(markets: list[dict]) -> None:
     console.print(table)
 
 
-async def run_once(
+def _market_key(market: dict) -> str:
+    """Canonical key for a market (for dedup / order tracking)."""
+    return market.get("conditionId") or market.get("condition_id") or market.get("question", "")
+
+
+def _parse_window_times(market: dict) -> tuple[datetime | None, datetime | None]:
+    """Return (start_dt, end_dt) for a market window."""
+    slug = market.get("slug", "")
+    start_ts = parse_event_start_time(market)
+    end_date = market.get("endDate", "")
+    start_dt = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc) if start_ts else None
+    end_dt = None
+    if end_date:
+        try:
+            end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            pass
+    return start_dt, end_dt
+
+
+async def _analyze_asset(
     strategy: LLMStrategy,
-    search_terms: list[str] | None = None,
-    max_hours: float | None = None,
-) -> None:
-    """Run one iteration of the agent loop.
+    market: dict,
+    positions: list[dict],
+    price_tracker: PriceTracker,
+    asset: str,
+) -> dict | None:
+    """Run LLM analysis for a single asset/market. Returns signal dict or None.
 
-    If *search_terms* is given, re-search for the current live market(s)
-    matching those terms (so short-term markets auto-rotate to the next
-    live window).  Otherwise scan broadly.
+    Always records reasoning from the analysis so the AI builds context
+    across cycles, even when the trade is blocked by low confidence.
     """
-    if search_terms is not None:
-        console.print(f"\n[bold]Searching live market for: {', '.join(search_terms)}[/bold]")
-        markets = await gamma.search_and_filter(terms=search_terms, max_hours=max_hours)
-        if not markets:
-            console.print("[yellow]No live market found for this window. Waiting for next...[/yellow]")
-            return
-        console.print(f"Found {len(markets)} live market(s)")
-        for m in markets:
-            console.print(f"  • {m.get('question', '?')}")
-    else:
-        console.print("\n[bold]Scanning markets...[/bold]")
-        markets = await scan_markets(limit=50)
-        console.print(f"Found {len(markets)} markets passing filters")
+    mk = _market_key(market)
+    tracker_data = price_tracker.get_history(asset)
+    reasoning = get_reasoning_history(mk)
 
-    positions = []
+    try:
+        signal, analysis = await strategy.evaluate(
+            market,
+            positions,
+            price_tracker_data=tracker_data,
+            reasoning_chain=reasoning,
+        )
+    except Exception as exc:
+        log.error("Error evaluating %s: %s", asset, exc)
+        return None
+
+    # Always record AI reasoning so it accumulates across cycles
+    last_spot = tracker_data[-1]["spot_price"] if tracker_data else None
+    last_ref = tracker_data[-1].get("reference_price") if tracker_data else None
+    record_reasoning(
+        market_key=mk,
+        recommendation=analysis.recommendation,
+        confidence=analysis.confidence,
+        reasoning=analysis.reasoning,
+        spot_price=last_spot,
+        reference_price=last_ref,
+    )
+
+    if signal is None:
+        if analysis.recommendation == "SKIP":
+            console.print(f"  [{asset.upper()}] → SKIP ({analysis.confidence:.0%} conf) — {analysis.reasoning[:80]}")
+        else:
+            console.print(
+                f"  [{asset.upper()}] → [bold yellow]{analysis.recommendation} BLOCKED[/bold yellow] "
+                f"(conf {analysis.confidence:.0%} < min {settings.min_confidence:.0%}) "
+                f"— {analysis.reasoning[:80]}"
+            )
+        return None
+
+    return {"asset": asset, "market": market, "signal": signal, "market_key": mk}
+
+
+async def _monitor_window(
+    strategy: LLMStrategy,
+    markets: list[dict],
+    price_tracker: PriceTracker,
+) -> datetime | None:
+    """Run the two-phase accumulation + analysis loop for one set of markets.
+
+    Phase 1 (accumulation): every 30s, fetch spot prices and record snapshots.
+    Phase 2 (analysis): once min_elapsed_pct is met, also run LLM analysis every 60s.
+    Exits when all assets are traded or the earliest window expires.
+
+    Returns the earliest window end time so the caller can wait for it.
+    """
+    if not markets:
+        return None
+
+    risk = strategy.risk_tolerance or settings.risk_tolerance
+    min_pct = _MIN_ELAPSED_PCT.get(risk, 0.40)
+
+    # Build asset → market mapping
+    asset_markets: dict[str, dict] = {}
+    for m in markets:
+        asset = extract_asset_from_slug(m.get("slug", ""))
+        if asset:
+            asset_markets[asset] = m
+
+    if not asset_markets:
+        console.print("[yellow]No crypto up/down markets found in this set.[/yellow]")
+        return None
+
+    traded_assets: set[str] = set()  # assets that have been traded this window
+
+    # Determine earliest window end
+    earliest_end: datetime | None = None
+    for m in asset_markets.values():
+        _, end_dt = _parse_window_times(m)
+        if end_dt:
+            if earliest_end is None or end_dt < earliest_end:
+                earliest_end = end_dt
+
+    # Get reference prices (once at start)
+    from polymarket_agent.crypto_prices import get_price_at_time
+
+    reference_prices: dict[str, float | None] = {}
+    for asset, m in asset_markets.items():
+        start_ts = parse_event_start_time(m)
+        if start_ts:
+            reference_prices[asset] = await get_price_at_time(asset, start_ts)
+        else:
+            reference_prices[asset] = None
+
+    positions: list[dict] = []
     try:
         positions = await data.get_positions()
     except Exception as exc:
         log.warning("Could not fetch positions: %s", exc)
 
-    # Minimum % of window that must have elapsed before trading (by risk level)
-    _MIN_ELAPSED_PCT: dict[str, float] = {
-        "conservative": 0.60,  # wait until 60% of window elapsed
-        "moderate": 0.40,      # wait until 40% of window elapsed
-        "aggressive": 0.15,    # wait until 15% of window elapsed
-    }
+    console.print(f"\n[bold]Monitoring {len(asset_markets)} asset(s):[/bold] {', '.join(a.upper() for a in asset_markets)}")
+    console.print(f"Risk: {risk} | Min elapsed: {min_pct:.0%} | Earliest end: {earliest_end}")
 
-    for market in markets:
-        question = market.get("question", "?")
-        slug = market.get("slug", "")
-        console.print(f"\n[bold blue]Evaluating:[/bold blue] {question}")
+    last_analysis_time = 0.0  # epoch seconds of last analysis cycle
+    cycle = 0
 
-        # Time guard for short-term markets: don't trade too early in the window
-        if extract_asset_from_slug(slug):
-            start_ts = parse_event_start_time(market)
-            end_date = market.get("endDate", "")
-            if start_ts and end_date:
-                try:
-                    end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                    start_dt = datetime.fromtimestamp(start_ts / 1000, tz=timezone.utc)
-                    now = datetime.now(timezone.utc)
-                    window_secs = (end_dt - start_dt).total_seconds()
-                    elapsed_secs = (now - start_dt).total_seconds()
+    while True:
+        now = datetime.now(timezone.utc)
 
-                    if window_secs > 0 and elapsed_secs >= 0:
-                        elapsed_pct = elapsed_secs / window_secs
-                        risk = strategy.risk_tolerance or settings.risk_tolerance
-                        min_pct = _MIN_ELAPSED_PCT.get(risk, 0.40)
+        # Check if window expired
+        if earliest_end and now >= earliest_end:
+            console.print("\n[bold yellow]Window expired. Moving to next window.[/bold yellow]")
+            return earliest_end
 
-                        if elapsed_pct < min_pct:
-                            mins_elapsed = elapsed_secs / 60
-                            mins_total = window_secs / 60
-                            console.print(
-                                f"  → [bold yellow]TOO EARLY:[/bold yellow] "
-                                f"{mins_elapsed:.0f}m/{mins_total:.0f}m elapsed "
-                                f"({elapsed_pct:.0%} < {min_pct:.0%} required for {risk} risk). Waiting."
-                            )
-                            continue
-                except (ValueError, TypeError):
-                    pass
+        # Check if all assets traded
+        active_assets = set(asset_markets.keys()) - traded_assets
+        if not active_assets:
+            console.print("\n[bold green]All assets traded this window.[/bold green]")
+            return earliest_end
 
-        try:
-            signal = await strategy.evaluate(market, positions)
-        except Exception as exc:
-            log.error("Error evaluating %s: %s", slug, exc)
-            continue
+        cycle += 1
 
-        if signal is None:
-            console.print("  → SKIP")
-            continue
+        # --- Phase 1: Accumulate prices ---
+        for asset in active_assets:
+            spot = await get_spot_price(asset)
+            if spot is not None:
+                ref = reference_prices.get(asset)
+                snap = price_tracker.record_snapshot(asset, spot, ref)
+                diff_str = f"${snap['diff']:+,.2f}" if snap.get("diff") is not None else "N/A"
+                console.print(
+                    f"  [dim][{snap['timestamp']}][/dim] {asset.upper()} "
+                    f"${spot:,.2f} (diff: {diff_str})"
+                )
 
-        console.print(
-            f"  → [bold green]{signal.action}[/bold green] "
-            f"price={signal.price:.2f} max={round(signal.price + 0.03, 2):.2f} "
-            f"size={signal.size:.1f} confidence={signal.confidence:.0%}"
-        )
-        console.print(f"    Reasoning: {signal.reasoning[:120]}")
+        # --- Check elapsed % for each asset ---
+        ready_for_analysis: list[str] = []
+        for asset in active_assets:
+            m = asset_markets[asset]
+            start_dt, end_dt = _parse_window_times(m)
+            if start_dt and end_dt:
+                window_secs = (end_dt - start_dt).total_seconds()
+                elapsed_secs = (now - start_dt).total_seconds()
+                elapsed_pct = elapsed_secs / window_secs if window_secs > 0 else 0
+                if elapsed_pct >= min_pct:
+                    ready_for_analysis.append(asset)
+                else:
+                    mins_elapsed = elapsed_secs / 60
+                    mins_total = window_secs / 60
+                    console.print(
+                        f"  [{asset.upper()}] {mins_elapsed:.0f}m/{mins_total:.0f}m "
+                        f"({elapsed_pct:.0%} < {min_pct:.0%}) — accumulating"
+                    )
+            else:
+                # No timing info, allow analysis
+                ready_for_analysis.append(asset)
 
-        # Hard guard: skip if we already have an order on this market this session
-        market_key = market.get("conditionId") or market.get("condition_id") or market.get("question", "")
-        past_orders = get_order_history(market_key)
-        if past_orders:
-            console.print(
-                f"  → [bold yellow]BLOCKED:[/bold yellow] Already placed "
-                f"{len(past_orders)} order(s) on this market this session. Skipping."
-            )
-            continue
+        # --- Phase 2: Analysis (every ANALYSIS_INTERVAL seconds) ---
+        now_epoch = now.timestamp()
+        if ready_for_analysis and (now_epoch - last_analysis_time) >= ANALYSIS_INTERVAL:
+            last_analysis_time = now_epoch
+            console.print(f"\n[bold blue]Analysis cycle {cycle} — evaluating: {', '.join(a.upper() for a in ready_for_analysis)}[/bold blue]")
 
-        # Execute trade (market order — FOK with price ceiling)
-        # Allow up to 3 cents of slippage above the LLM's suggested price
-        max_price = round(signal.price + 0.03, 2)
-        try:
-            result = clob.market_buy(signal.token_id, signal.size, max_price=max_price)
-            console.print(f"  → [bold green]Order placed:[/bold green] {result}")
-            record_order(
-                market_key=market_key,
-                action=signal.action,
-                token_id=signal.token_id,
-                size=signal.size,
-                price=signal.price,
-            )
-        except Exception as exc:
-            log.error("Trade failed for %s: %s", slug, exc)
-            console.print(f"  → [bold red]Trade failed:[/bold red] {exc}")
+            # Run analysis in parallel for all ready assets
+            tasks = []
+            for asset in ready_for_analysis:
+                if asset in traded_assets:
+                    continue
+                m = asset_markets[asset]
+                # Check duplicate guard
+                mk = _market_key(m)
+                if get_order_history(mk):
+                    console.print(f"  [{asset.upper()}] Already traded this window. Skipping.")
+                    traded_assets.add(asset)
+                    continue
+                tasks.append(_analyze_asset(strategy, m, positions, price_tracker, asset))
+
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for result in results:
+                    if isinstance(result, Exception):
+                        log.error("Analysis task failed: %s", result)
+                        continue
+                    if result is None:
+                        # SKIP — record reasoning for tracking
+                        continue
+                    if not isinstance(result, dict):
+                        continue
+
+                    asset = result["asset"]
+                    signal = result["signal"]
+                    market = result["market"]
+                    mk = result["market_key"]
+
+                    console.print(
+                        f"  [{asset.upper()}] → [bold green]{signal.action}[/bold green] "
+                        f"price={signal.price:.2f} size={signal.size:.1f} "
+                        f"confidence={signal.confidence:.0%}"
+                    )
+                    console.print(f"    Reasoning: {signal.reasoning[:120]}")
+
+                    # Execute trade
+                    max_price = round(signal.price + 0.03, 2)
+                    try:
+                        order_result = clob.market_buy(signal.token_id, signal.size, max_price=max_price)
+                        console.print(f"  [{asset.upper()}] [bold green]Order placed:[/bold green] {order_result}")
+                        record_order(
+                            market_key=mk,
+                            action=signal.action,
+                            token_id=signal.token_id,
+                            size=signal.size,
+                            price=signal.price,
+                        )
+                        traded_assets.add(asset)
+                    except Exception as exc:
+                        log.error("Trade failed for %s: %s", asset, exc)
+                        console.print(f"  [{asset.upper()}] [bold red]Trade failed:[/bold red] {exc}")
+
+        # Sleep until next price sample
+        console.print(f"\n[dim]Next sample in {PRICE_SAMPLE_INTERVAL}s...[/dim]")
+        await asyncio.sleep(PRICE_SAMPLE_INTERVAL)
 
 
 class _SearchConfig:
@@ -181,7 +339,7 @@ async def _pick_markets() -> _SearchConfig | None:
 
     console.print(
         "\n[bold]What market do you want to monitor?[/bold]"
-        "\n  Examples: [cyan]btc 15min[/cyan], [cyan]eth 1h[/cyan], [cyan]sol 5min[/cyan]"
+        "\n  Examples: [cyan]btc 15min[/cyan], [cyan]eth 1h[/cyan], [cyan]15min[/cyan] (all crypto)"
         "\n  or [bold]all[/bold] to scan everything"
         "\n  or [bold]q[/bold] to quit"
     )
@@ -214,20 +372,23 @@ async def _pick_markets() -> _SearchConfig | None:
     table = Table(title=f"Found {len(markets)} market(s)")
     table.add_column("#", style="dim", width=4)
     table.add_column("Question", style="cyan", max_width=60)
+    table.add_column("Asset", style="bold", width=6)
     table.add_column("Volume", justify="right", style="green")
     table.add_column("End Date", style="yellow", max_width=20)
 
     for i, m in enumerate(markets, 1):
+        asset = extract_asset_from_slug(m.get("slug", "")) or "?"
         table.add_row(
             str(i),
             m.get("question", "?")[:60],
+            asset.upper(),
             f"${float(m.get('volume', 0) or 0):,.0f}",
             str(m.get("endDate", "?"))[:20],
         )
     console.print(table)
 
     console.print(
-        f"\n[green]Will monitor this search and auto-rotate to the next "
+        f"\n[green]Will monitor {len(markets)} market(s) and auto-rotate to the next "
         f"live window each iteration.[/green]"
     )
 
@@ -235,11 +396,11 @@ async def _pick_markets() -> _SearchConfig | None:
 
 
 async def run_loop(risk_tolerance: str | None = None) -> None:
-    """Run the agent in a continuous loop."""
+    """Run the agent in a continuous loop with price accumulation."""
     risk = risk_tolerance or settings.risk_tolerance
     console.print("[bold]Starting Polymarket Agent[/bold]")
     console.print(f"Risk tolerance: [bold yellow]{risk}[/bold yellow]")
-    console.print(f"Scan interval: {settings.scan_interval_seconds}s")
+    console.print(f"Price sampling: every {PRICE_SAMPLE_INTERVAL}s | Analysis: every {ANALYSIS_INTERVAL}s")
     console.print(f"Max bet: ${settings.max_bet_usdc}")
 
     # Initialize CLOB client
@@ -257,18 +418,53 @@ async def run_loop(risk_tolerance: str | None = None) -> None:
         return
 
     strategy = LLMStrategy(risk_tolerance=risk)
+    price_tracker = PriceTracker()
 
     while True:
         try:
+            # Search for current live markets
             if search_cfg is not None:
-                await run_once(strategy, search_terms=search_cfg.terms, max_hours=search_cfg.max_hours)
+                console.print(f"\n[bold]Searching live markets for: {', '.join(search_cfg.terms)}[/bold]")
+                markets = await gamma.search_and_filter(
+                    terms=search_cfg.terms, max_hours=search_cfg.max_hours
+                )
+                if not markets:
+                    console.print("[yellow]No live market found. Waiting 30s for next window...[/yellow]")
+                    await asyncio.sleep(30)
+                    continue
+                console.print(f"Found {len(markets)} live market(s)")
+                for m in markets:
+                    asset = extract_asset_from_slug(m.get("slug", "")) or "?"
+                    console.print(f"  • [{asset.upper()}] {m.get('question', '?')}")
             else:
-                await run_once(strategy)
+                console.print("\n[bold]Scanning markets...[/bold]")
+                raw_markets = await scan_markets(limit=50)
+                markets = raw_markets
+                console.print(f"Found {len(markets)} markets passing filters")
+
+            # Clear per-window state and price history for fresh start
+            clear_all_window_state()
+            price_tracker.clear_all()
+
+            # Run the two-phase monitor for this window
+            window_end = await _monitor_window(strategy, markets, price_tracker)
+
+            # Wait until the window actually expires before searching for the next one
+            if window_end:
+                now = datetime.now(timezone.utc)
+                wait_secs = (window_end - now).total_seconds()
+                if wait_secs > 0:
+                    console.print(
+                        f"\n[dim]Window ends in {wait_secs:.0f}s. "
+                        f"Waiting for expiry before next search...[/dim]"
+                    )
+                    await asyncio.sleep(wait_secs + 5)  # +5s buffer
+                    continue
+
         except Exception as exc:
             log.error("Agent loop error: %s", exc)
             console.print(f"[bold red]Error:[/bold red] {exc}")
 
-        console.print(
-            f"\n[dim]Sleeping {settings.scan_interval_seconds}s...[/dim]"
-        )
-        await asyncio.sleep(settings.scan_interval_seconds)
+        # Brief pause before searching for next window
+        console.print(f"\n[dim]Searching for next window in 10s...[/dim]")
+        await asyncio.sleep(10)

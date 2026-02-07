@@ -28,7 +28,6 @@ class Settings(BaseSettings):
     max_bet_usdc: float = 50.0
     max_portfolio_usdc: float = 500.0
     min_confidence: float = 0.3
-    scan_interval_seconds: int = 300
     min_liquidity: float = 1000.0
     min_volume: float = 5000.0
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -104,3 +105,85 @@ def parse_event_start_time(market: dict[str, Any]) -> int | None:
         return int(match.group(1)) * 1000
 
     return None
+
+
+class PriceTracker:
+    """Accumulates per-asset price snapshots over time for trend analysis."""
+
+    def __init__(self) -> None:
+        self._history: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    def record_snapshot(
+        self,
+        asset: str,
+        spot_price: float,
+        reference_price: float | None,
+    ) -> dict[str, Any]:
+        """Append a price snapshot for *asset* and return it."""
+        diff = round(spot_price - reference_price, 4) if reference_price else None
+        diff_pct = (
+            round((spot_price - reference_price) / reference_price * 100, 4)
+            if reference_price
+            else None
+        )
+        snapshot = {
+            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "spot_price": spot_price,
+            "reference_price": reference_price,
+            "diff": diff,
+            "diff_pct": diff_pct,
+        }
+        self._history[asset.upper()].append(snapshot)
+        return snapshot
+
+    def get_history(self, asset: str) -> list[dict[str, Any]]:
+        """Return the full list of snapshots for *asset*."""
+        return list(self._history.get(asset.upper(), []))
+
+    def get_summary(self, asset: str) -> str:
+        """Return a formatted summary string for *asset*: trend, streaks, range."""
+        history = self._history.get(asset.upper(), [])
+        if not history:
+            return f"{asset.upper()}: no data"
+
+        spots = [s["spot_price"] for s in history]
+        hi, lo = max(spots), min(spots)
+        first, last = spots[0], spots[-1]
+        total_change = last - first
+        total_pct = (total_change / first * 100) if first else 0
+
+        # Consecutive streak
+        streak_dir = ""
+        streak_count = 0
+        for i in range(1, len(spots)):
+            if spots[i] > spots[i - 1]:
+                if streak_dir == "up":
+                    streak_count += 1
+                else:
+                    streak_dir = "up"
+                    streak_count = 1
+            elif spots[i] < spots[i - 1]:
+                if streak_dir == "down":
+                    streak_count += 1
+                else:
+                    streak_dir = "down"
+                    streak_count = 1
+            # equal → streak continues as-is
+
+        direction = "UP" if total_change > 0 else "DOWN" if total_change < 0 else "FLAT"
+        lines = [
+            f"{asset.upper()}: {len(history)} snapshots | {direction}",
+            f"  Range: ${lo:,.2f} – ${hi:,.2f}",
+            f"  Total change: ${total_change:+,.2f} ({total_pct:+.3f}%)",
+        ]
+        if streak_count:
+            lines.append(f"  Current streak: {streak_count} consecutive {streak_dir}")
+        return "\n".join(lines)
+
+    def clear(self, asset: str) -> None:
+        """Reset history for *asset*."""
+        self._history.pop(asset.upper(), None)
+
+    def clear_all(self) -> None:
+        """Reset history for all assets."""
+        self._history.clear()
