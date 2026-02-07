@@ -191,6 +191,45 @@ async def get_price_history(
         return []
 
 
+def check_orderbook_liquidity(token_id: str, side: str, size: float, max_price: float) -> bool:
+    """Check if the order book has enough liquidity to fill a FOK order.
+
+    For BUY orders, sums ask sizes at or below *max_price*.
+    Returns True if available liquidity >= requested *size*.
+    """
+    try:
+        book = get_orderbook(token_id)
+        if hasattr(book, "asks"):
+            asks = book.asks or []
+            bids = book.bids or []
+        else:
+            asks = book.get("asks", [])
+            bids = book.get("bids", [])
+
+        def _val(entry: Any, key: str) -> float:
+            if hasattr(entry, key):
+                return float(getattr(entry, key, 0))
+            return float(entry.get(key, 0)) if isinstance(entry, dict) else 0.0
+
+        if side.upper() == "BUY":
+            available = sum(
+                _val(o, "size") for o in asks if _val(o, "price") <= max_price
+            )
+        else:
+            available = sum(
+                _val(o, "size") for o in bids if _val(o, "price") >= max_price
+            )
+
+        logger.info(
+            "Liquidity check: side=%s size=%.2f max_price=%.2f available=%.2f sufficient=%s",
+            side, size, max_price, available, available >= size,
+        )
+        return available >= size
+    except Exception as exc:
+        logger.warning("Liquidity check failed: %s — proceeding with order", exc)
+        return True  # On error, let the FOK decide
+
+
 def get_orderbook_summary(token_id: str) -> dict[str, Any]:
     """Get a compact summary of the current order book.
 

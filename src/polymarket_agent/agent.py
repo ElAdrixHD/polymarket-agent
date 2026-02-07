@@ -292,22 +292,43 @@ async def _analysis_task(
                 )
                 console.print(f"    Reasoning: {signal.reasoning[:120]}")
 
-                # Execute trade
+                # Execute trade with liquidity check + retries
                 max_price = round(signal.price + 0.03, 2)
-                try:
-                    order_result = clob.market_buy(signal.token_id, signal.size, max_price=max_price)
-                    console.print(f"  [{asset.upper()}] [bold green]Order placed:[/bold green] {order_result}")
-                    record_order(
-                        market_key=mk,
-                        action=signal.action,
-                        token_id=signal.token_id,
-                        size=signal.size,
-                        price=signal.price,
+                max_retries = 3
+                retry_delay = 1.0  # seconds
+
+                # Pre-flight liquidity check
+                if not clob.check_orderbook_liquidity(signal.token_id, "BUY", signal.size, max_price):
+                    console.print(
+                        f"  [{asset.upper()}] [bold yellow]Skipped:[/bold yellow] "
+                        f"insufficient liquidity (need {signal.size:.1f} @ <={max_price})"
                     )
-                    traded_assets.add(asset)
-                except Exception as exc:
-                    log.error("Trade failed for %s: %s", asset, exc)
-                    console.print(f"  [{asset.upper()}] [bold red]Trade failed:[/bold red] {exc}")
+                    continue
+
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        order_result = clob.market_buy(signal.token_id, signal.size, max_price=max_price)
+                        console.print(f"  [{asset.upper()}] [bold green]Order placed:[/bold green] {order_result}")
+                        record_order(
+                            market_key=mk,
+                            action=signal.action,
+                            token_id=signal.token_id,
+                            size=signal.size,
+                            price=signal.price,
+                        )
+                        traded_assets.add(asset)
+                        break
+                    except Exception as exc:
+                        if attempt < max_retries:
+                            log.warning("Trade attempt %d/%d failed for %s: %s — retrying in %.1fs",
+                                        attempt, max_retries, asset, exc, retry_delay)
+                            console.print(
+                                f"  [{asset.upper()}] [bold yellow]Attempt {attempt}/{max_retries} failed,[/bold yellow] retrying..."
+                            )
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            log.error("Trade failed for %s after %d attempts: %s", asset, max_retries, exc)
+                            console.print(f"  [{asset.upper()}] [bold red]Trade failed after {max_retries} attempts:[/bold red] {exc}")
 
 
 async def _monitor_window(
