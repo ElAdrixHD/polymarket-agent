@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     min_liquidity: float = 1000.0
     min_volume: float = 5000.0
 
+    # Agent timing (seconds)
+    price_sample_interval: int = 30  # How often to collect price samples
+    analysis_interval: int = 60  # How often to run LLM analysis
+
     # API endpoints
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     clob_api_url: str = "https://clob.polymarket.com"

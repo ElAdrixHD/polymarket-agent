@@ -132,7 +132,7 @@ async def _call_openai(system: str, user: str) -> str:
             {"role": "user", "content": user},
         ],
         temperature=0.3,
-        max_tokens=2048,
+        max_tokens=5000,
     )
     return resp.choices[0].message.content or ""
 
@@ -151,7 +151,7 @@ async def _call_anthropic(system: str, user: str) -> str:
     )
     resp = await client.messages.create(
         model=settings.llm_model,
-        max_tokens=1024,
+        max_tokens=5000,
         system=system,
         messages=[{"role": "user", "content": user}],
     )
