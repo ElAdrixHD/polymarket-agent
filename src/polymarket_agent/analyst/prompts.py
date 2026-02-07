@@ -1,5 +1,6 @@
 """Prompt templates for LLM market analysis."""
 
+import math
 from datetime import datetime, timezone
 
 QUERY_SYSTEM_PROMPT = """\
@@ -61,7 +62,9 @@ You will be given real market data to inform your decision:
 LIVE spot price from Binance and the market's reference price. This is your MOST IMPORTANT signal:
   - If spot > reference → asset is UP → YES should win → BUY_YES
   - If spot < reference → asset is DOWN → NO should win → BUY_NO
-  - The magnitude of the difference relative to time remaining determines confidence.
+  - The magnitude of the difference relative to **observed volatility** and time remaining determines confidence.
+  - **Check the "Dynamic Risk Assessment" section** — it shows how much the price has actually \
+swung during the observation window. A $300 lead means nothing if the price swung $500 in the last 5 minutes.
   - **This is real external data, not market opinion. Trust it over order book sentiment.**
 - **Momentum**: If price has been trending up (series of higher prices), that suggests \
 YES is gaining. If trending down, NO side is gaining.
@@ -89,28 +92,47 @@ on a single market.
 unless you have very high confidence.
 - If the market moved in your favor, consider whether the edge is now too small to add more.
 
-## Short-Term Markets (Up or Down)
-These are binary markets that resolve within minutes or hours. Key considerations:
-- **Time decay matters**: as resolution approaches, prices should converge to true probability fast.
+## Short-Term Markets (Up or Down) — CRITICAL RULES
+These are binary markets that resolve based on whether the spot price is ABOVE or BELOW \
+a reference price at a specific time. **The ONLY thing that matters is the final price \
+relative to the reference.**
+
+### What determines the outcome
+- The market resolves YES if the spot price is ABOVE the reference price at expiry.
+- The market resolves NO if the spot price is BELOW the reference price at expiry.
+- **A small dip while still above reference does NOT mean NO will win.** Example: if \
+reference is $69,000 and spot goes from $69,200 → $69,100, that is still UP. Do NOT \
+interpret this as "reversal" or "momentum shift toward NO".
+
+### How to decide
+- **POSITION vs REFERENCE is your #1 signal**: Is the spot price currently above or below \
+the reference? By how much? This is more important than any short-term momentum.
+- **Use observed volatility to judge reversal probability**: Check the Dynamic Risk Assessment. \
+If the current lead (|spot - reference|) is larger than what the observed volatility suggests \
+can reverse in the remaining time, that's a strong signal.
+- **Micro-movements are NOT momentum reversals**: The spot price fluctuates constantly. A \
+$50-100 pullback in BTC while still $150 above reference is normal noise, NOT a bearish signal. \
+Only consider it a reversal risk if the price is approaching or crossing the reference.
+- **Time decay matters**: as resolution approaches, if the price is firmly on one side of the \
+reference, the probability of it staying there increases (less time for reversal).
 - **SKIP = guaranteed loss of opportunity**: these markets expire quickly, so being in the market \
 with even a small edge is better than missing it entirely.
-- **Momentum is king**: in short timeframes, recent price trends and order book pressure are the \
-strongest signals. Fundamentals matter less.
-- **NEVER fight the trend**: if price is dropping sharply (e.g. YES went from 0.50 → 0.20), that is \
-strong bearish momentum — do NOT buy YES thinking it's "undervalued" or "cheap". A falling price means \
-the market is repricing downward. Follow the momentum direction, not "value".
-- **A large price drop is NOT a buying opportunity**: if YES dropped 50%+ in minutes, that's a crash, \
-not a discount. The correct trade is BUY_NO (or SKIP), never BUY_YES against the trend.
-- **Use price history direction**: look at the TREND in price history, not individual price levels. \
-If the last N points show consistent decline, trade WITH that direction.
 - **Lower your edge threshold**: for markets expiring in < 30 minutes, an edge of 2 cents is actionable.
 
+### Common mistakes to AVOID
+- **DO NOT BUY_NO just because the price dipped slightly while still above reference.** \
+If spot is $69,100 and reference is $69,000, BUY_YES is correct even if spot just dropped from $69,200.
+- **DO NOT confuse market token price momentum with spot price position.** The YES token \
+price may fluctuate, but what matters is where the SPOT PRICE is relative to the REFERENCE.
+- **DO NOT overthink momentum**: a $50 pullback in a $69,000 asset is 0.07% — that's noise.
+
 ## Decision Framework
-1. Look at the price trend — is there clear momentum in one direction?
-2. Check order book pressure — does it confirm or contradict the trend?
-3. Estimate the true probability based on all available signals
-4. Compare to current price to find edges >= 3 cents (2 cents for short-term markets)
-5. Only SKIP if you truly cannot form an opinion or the edge is < 2 cents
+1. **Position check**: Is spot above or below reference? By how much?
+2. **Volatility check**: Can the observed volatility reverse this lead in the remaining time?
+3. **Order book**: Does bid/ask pressure confirm or contradict?
+4. Estimate the true probability based on all available signals
+5. Compare to current price to find edges >= 3 cents (2 cents for short-term markets)
+6. Only SKIP if you truly cannot form an opinion or the edge is < 2 cents
 
 Always respond with ONLY valid JSON (no markdown, no extra text) matching this schema:
 {
@@ -222,55 +244,108 @@ def build_analysis_prompt(
             else:
                 parts.append(f"- **Direction:** {spot_price_info['asset']} is AT the reference → coin flip")
 
-    # Dynamic risk guidance based on time remaining + price movement
-    # Uses dollar-based volatility thresholds calibrated per asset.
-    # Typical BTC volatility: ~$50/min, ~$150/5min, ~$300/15min
-    # Typical ETH volatility: ~$5/min, ~$15/5min, ~$30/15min
-    _VOLATILITY_PER_MIN: dict[str, float] = {
-        "BTC": 50.0, "ETH": 5.0, "SOL": 0.20, "XRP": 0.002,
-    }
+    # Dynamic risk guidance based on OBSERVED volatility from price tracker.
+    # No static fallback — if there aren't enough price samples yet, the
+    # risk assessment section is simply omitted until data accumulates.
 
-    if spot_price_info and spot_price_info.get("price_diff") is not None and total_seconds > 0:
+    # Compute observed volatility from accumulated price snapshots
+    observed_vol: dict[str, float] | None = None
+    if price_tracker_data and len(price_tracker_data) >= 3:
+        spots = [s["spot_price"] for s in price_tracker_data]
+        n = len(spots)
+        hi, lo = max(spots), min(spots)
+        max_swing = hi - lo
+
+        # Consecutive changes (absolute)
+        consec_changes = [abs(spots[i] - spots[i - 1]) for i in range(1, n)]
+        avg_change = sum(consec_changes) / len(consec_changes)
+        max_consec_change = max(consec_changes)
+
+        # Standard deviation of prices
+        mean_price = sum(spots) / n
+        variance = sum((p - mean_price) ** 2 for p in spots) / n
+        std_dev = math.sqrt(variance)
+
+        # Estimate time span between samples (use timestamps if available)
+        sample_interval_s = 10.0  # default
+        if len(price_tracker_data) >= 2:
+            try:
+                t0 = datetime.strptime(price_tracker_data[0]["timestamp"], "%H:%M:%S")
+                t1 = datetime.strptime(price_tracker_data[-1]["timestamp"], "%H:%M:%S")
+                span_s = (t1 - t0).total_seconds()
+                if span_s > 0:
+                    sample_interval_s = span_s / (n - 1)
+            except (KeyError, ValueError):
+                pass
+
+        total_span_s = sample_interval_s * (n - 1)
+
+        # Volatility per sample step (sigma per step, random walk model)
+        # avg_change ≈ sigma per step.  To project over N future steps:
+        #   expected_swing = sigma * sqrt(N)   (NOT sigma * N)
+        sigma_per_step = avg_change
+        steps_per_min = 60.0 / sample_interval_s if sample_interval_s > 0 else 6
+
+        observed_vol = {
+            "max_swing": max_swing,
+            "avg_change": avg_change,
+            "max_consec_change": max_consec_change,
+            "std_dev": std_dev,
+            "sigma_per_step": sigma_per_step,
+            "step_interval_s": sample_interval_s,
+            "steps_per_min": steps_per_min,
+            "samples": n,
+            "span_s": total_span_s,
+        }
+
+    if spot_price_info and spot_price_info.get("price_diff") is not None and total_seconds > 0 and observed_vol:
         abs_diff = abs(spot_price_info["price_diff"])
         diff = spot_price_info["price_diff"]
-        asset = spot_price_info["asset"]
         mins_left = total_seconds / 60
 
-        # Expected volatility for the remaining time (scales with sqrt of time)
-        vol_per_min = _VOLATILITY_PER_MIN.get(asset, 50.0)
-        expected_swing = vol_per_min * (mins_left ** 0.5)
+        # Project expected swing using random walk: sigma * sqrt(steps_remaining)
+        steps_remaining = mins_left * observed_vol["steps_per_min"]
+        expected_swing = observed_vol["sigma_per_step"] * math.sqrt(steps_remaining) if steps_remaining > 0 else 0
 
         # How many "expected swings" is the current move?
         # >2x = very strong, 1-2x = solid, 0.5-1x = moderate, <0.5x = noise
         strength = abs_diff / expected_swing if expected_swing > 0 else 0
 
-        parts.append(f"\n## Dynamic Risk Assessment")
-        parts.append(f"- **Price move:** ${diff:+,.2f} from reference")
-        parts.append(f"- **Expected {asset} swing in {mins_left:.0f}min:** ~${expected_swing:,.0f}")
-        parts.append(f"- **Signal strength:** {strength:.1f}x expected volatility")
+        parts.append(f"\n## Dynamic Risk Assessment (based on observed volatility)")
+        parts.append(f"- **Current position:** ${diff:+,.2f} from reference ({'ABOVE' if diff > 0 else 'BELOW'} → favors {'YES' if diff > 0 else 'NO'})")
+        parts.append(f"- **Observed sigma per {observed_vol['step_interval_s']:.0f}s step:** ${observed_vol['sigma_per_step']:,.2f}")
+        parts.append(f"- **Steps remaining (~{observed_vol['step_interval_s']:.0f}s each):** {steps_remaining:.0f}")
+        parts.append(f"- **Expected random-walk swing in {mins_left:.1f}min:** ~${expected_swing:,.0f}")
+        parts.append(f"- **Signal strength:** {strength:.1f}x expected swing")
+
+        parts.append(f"\n### Observed Volatility Detail")
+        parts.append(f"- **Max swing (high-low) in window:** ${observed_vol['max_swing']:,.2f}")
+        parts.append(f"- **Avg change between consecutive samples:** ${observed_vol['avg_change']:,.2f}")
+        parts.append(f"- **Max single-sample jump:** ${observed_vol['max_consec_change']:,.2f}")
+        parts.append(f"- **Std deviation of prices:** ${observed_vol['std_dev']:,.2f}")
 
         if strength >= 2.0:
             parts.append(
-                f"- **RISK: LOW** — Move is {strength:.1f}x the expected swing. "
-                f"Very strong signal. {asset} would need an extraordinary reversal "
-                f"of ${abs_diff:,.0f} in {mins_left:.0f}min to flip. High confidence trade."
+                f"- **CONCLUSION: STRONG position.** The price is {strength:.1f}x the expected swing away from "
+                f"the reference. Reversal is very unlikely in {mins_left:.1f}min. "
+                f"{'BUY_YES is strongly supported.' if diff > 0 else 'BUY_NO is strongly supported.'}"
             )
         elif strength >= 1.0:
             parts.append(
-                f"- **RISK: LOW-MODERATE** — Move is {strength:.1f}x the expected swing. "
-                f"Solid signal. Reversal is possible but unlikely in {mins_left:.0f}min. "
-                f"Trade with good confidence."
+                f"- **CONCLUSION: SOLID position.** The price is {strength:.1f}x the expected swing away from "
+                f"the reference. Reversal is possible but unlikely. "
+                f"{'BUY_YES is supported.' if diff > 0 else 'BUY_NO is supported.'}"
             )
         elif strength >= 0.5:
             parts.append(
-                f"- **RISK: MODERATE** — Move is only {strength:.1f}x the expected swing. "
-                f"The current direction could easily reverse. Trade with caution, smaller size."
+                f"- **CONCLUSION: WEAK position.** The price is only {strength:.1f}x the expected swing. "
+                f"Reversal is plausible. Trade with caution or SKIP."
             )
         else:
             parts.append(
-                f"- **RISK: HIGH** — Move is only {strength:.1f}x the expected swing. "
-                f"This is within normal noise for {asset}. Essentially a coin flip. "
-                f"Prefer SKIP unless other signals are very strong."
+                f"- **CONCLUSION: NOISE.** The price is only {strength:.1f}x the expected swing. "
+                f"This is within normal random walk range. Essentially a coin flip. "
+                f"Prefer SKIP or trade the CURRENT side with low confidence."
             )
 
     # Enriched market signals from Gamma
