@@ -547,27 +547,24 @@ class LLMStrategy:
             )
             return None, info
 
-        # --- Confidence-based sizing ---
+        # --- Confidence-based sizing (in USDC) ---
         size_usd = settings.max_bet_usdc * size_fraction
-
-        # Convert to shares
-        size_shares = size_usd / actual_price if actual_price > 0 else 0
 
         # Cap by available balance
         if bankroll is None:
             bankroll = clob.get_balance()
-        if bankroll is not None and bankroll < size_shares * actual_price:
-            size_shares = bankroll / actual_price if actual_price > 0 else 0
+        if bankroll is not None and size_usd > bankroll:
+            size_usd = bankroll
 
-        # Enforce minimum order size — bump up if affordable
-        if size_shares < min_order_size:
-            min_cost = min_order_size * actual_price
+        # Enforce minimum order cost
+        min_cost = min_order_size * actual_price
+        if size_usd < min_cost:
             if min_cost <= settings.max_bet_usdc and (bankroll is None or min_cost <= bankroll):
-                size_shares = min_order_size
+                size_usd = min_cost
             else:
                 info["reasoning"] = (
-                    f"Size {size_shares:.1f} < min {min_order_size:.0f} "
-                    f"(cost ${min_cost:.2f} > budget)"
+                    f"Size ${size_usd:.2f} < min cost ${min_cost:.2f} "
+                    f"(min_order={min_order_size:.0f} shares × ${actual_price:.2f})"
                 )
                 return None, info
 
@@ -576,23 +573,24 @@ class LLMStrategy:
             float(p.get("size", 0) or 0) * float(p.get("currentPrice", 0) or 0)
             for p in positions
         )
-        if current_exposure + (size_shares * actual_price) > settings.max_portfolio_usdc:
+        if current_exposure + size_usd > settings.max_portfolio_usdc:
             remaining = settings.max_portfolio_usdc - current_exposure
-            if remaining > 0 and remaining / actual_price >= min_order_size:
-                size_shares = remaining / actual_price
+            if remaining >= min_cost:
+                size_usd = remaining
             else:
                 info["reasoning"] = "Portfolio limit reached"
                 return None, info
 
-        # Cap by max_bet in shares
-        max_shares = settings.max_bet_usdc / actual_price if actual_price > 0 else 0
-        if size_shares > max_shares:
-            size_shares = max_shares
+        # Cap by max_bet
+        if size_usd > settings.max_bet_usdc:
+            size_usd = settings.max_bet_usdc
+
+        size_usd = round(size_usd, 2)
 
         potential_return = (1.0 - actual_price) / actual_price * 100 if actual_price > 0 else 0
         trade_reasoning = (
             f"LLM: {decision['recommendation']} ({decision['confidence']:.0%}) | "
-            f"Size: ${size_shares * actual_price:.2f} ({size_fraction:.0%} of max) | "
+            f"Size: ${size_usd:.2f} ({size_fraction:.0%} of max) | "
             f"Ask=${actual_price:.4f} Return={potential_return:.1f}% | "
             f"Math: {direction} {sig_strength:.1f}x P={prob_yes:.1%} | "
             f"{decision['reasoning']}"
@@ -603,7 +601,7 @@ class LLMStrategy:
             action=decision["recommendation"],
             token_id=token_id,
             price=actual_price,
-            size=round(size_shares, 1),
+            size=size_usd,
             confidence=decision["confidence"],
             reasoning=trade_reasoning,
         ), info

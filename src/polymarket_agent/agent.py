@@ -306,22 +306,20 @@ async def _analysis_task(
 
                 console.print(
                     f"  [{asset.upper()}] → [bold green]{signal.action}[/bold green] "
-                    f"best_ask={signal.price:.4f} size={signal.size:.1f} "
+                    f"ask={signal.price:.4f} ${signal.size:.2f} "
                     f"confidence={signal.confidence:.0%}"
                 )
                 console.print(f"    Reasoning: {signal.reasoning[:120]}")
 
-                # Execute as a market order (FOK) at the best available price.
-                # Edge was already validated in the strategy against the real
-                # best_ask, so we use max_price=0.99 to fill at whatever the
-                # market offers.  The FOK order type ensures we either fill
-                # entirely or not at all.
+                # Execute as a FOK market buy order.  signal.size is the
+                # USDC amount to spend; the library calculates price and
+                # shares automatically from the orderbook.
                 max_retries = 3
                 retry_delay = 1.0  # seconds
 
                 for attempt in range(1, max_retries + 1):
                     try:
-                        order_result = clob.market_buy(signal.token_id, signal.size, max_price=signal.price)
+                        order_result = clob.market_buy(signal.token_id, signal.size)
                         console.print(f"  [{asset.upper()}] [bold green]Order placed:[/bold green] {order_result}")
                         record_order(
                             market_key=mk,

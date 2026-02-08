@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, OrderArgs, OrderType
+from py_clob_client.clob_types import AssetType, BalanceAllowanceParams, MarketOrderArgs, OrderArgs, OrderType
 
 from polymarket_agent.config import settings
 
@@ -145,25 +145,21 @@ def sell(token_id: str, price: float, size: float) -> dict[str, Any]:
     return client.post_order(signed, OrderType.GTC)
 
 
-def market_buy(token_id: str, amount: float, max_price: float = 0.99) -> dict[str, Any]:
+def market_buy(token_id: str, usdc_amount: float) -> dict[str, Any]:
     """Place a FOK market buy order.
 
-    *max_price* is the ceiling price — the order will only fill if the
-    available price is at or below this value.  Defaults to 0.99 (max).
+    *usdc_amount* is the USDC dollar amount to spend.  The library
+    automatically calculates the best price from the orderbook and
+    handles all rounding/precision internally.
     """
     client = _get_client()
-    # Clamp to valid Polymarket range
-    price = max(0.01, min(max_price, 0.99))
-    # Round to required precision: price (maker) 2 decimals, size (taker) 4 decimals
-    price = round(price, 2)
-    amount = round(amount, 4)
-    order_args = OrderArgs(
-        price=price,
-        size=amount,
-        side="BUY",
+    usdc_amount = round(usdc_amount, 2)
+    order_args = MarketOrderArgs(
         token_id=token_id,
+        amount=usdc_amount,
+        side="BUY",
     )
-    signed = client.create_order(order_args)
+    signed = client.create_market_order(order_args)
     return client.post_order(signed, OrderType.FOK)
 
 
