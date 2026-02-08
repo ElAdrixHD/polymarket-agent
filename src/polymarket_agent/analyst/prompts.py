@@ -11,8 +11,7 @@ Extract the search parameters from the user's request and respond with valid JSO
 {
   "search_terms": ["keyword1", "keyword2"],
   "max_hours": number or null,
-  "action": "search" | "analyze",
-  "risk_tolerance": "string" or null
+  "action": "search" | "analyze"
 }
 
 Rules:
@@ -25,18 +24,16 @@ Rules:
   and include the timeframe as a search term instead (e.g. "15min", "5min", "1h").
   Only set max_hours when the user explicitly says "expiring in", "closing in", "ending within", etc.
 - action: "search" if user just wants to see/list markets, "analyze" if they want analysis/recommendations
-- risk_tolerance: if the user mentions risk preference, extract it. null otherwise.
-
 Polymarket has these short-term "Up or Down" markets for crypto (BTC, ETH, SOL, XRP) in 5min, 15min, and 1h intervals. \
 Their slugs look like: btc-updown-15m-{timestamp}, eth-updown-5m-{timestamp}, etc.
 
 Examples:
-- "show me btc bets expiring in 1h" → {"search_terms": ["bitcoin", "btc"], "max_hours": 1, "action": "search", "risk_tolerance": null}
-- "analyze btc 15min" → {"search_terms": ["bitcoin", "btc", "up or down", "15"], "max_hours": null, "action": "analyze", "risk_tolerance": null}
-- "analyze crypto markets closing in 15min aggressively" → {"search_terms": ["crypto", "bitcoin", "ethereum"], "max_hours": 0.25, "action": "analyze", "risk_tolerance": "aggressive"}
-- "what political bets are there?" → {"search_terms": ["politics", "trump", "election"], "max_hours": null, "action": "search", "risk_tolerance": null}
-- "btc 1h markets" → {"search_terms": ["bitcoin", "btc", "up or down", "1h"], "max_hours": null, "action": "search", "risk_tolerance": null}
-- "eth 5min" → {"search_terms": ["ethereum", "eth", "up or down", "5"], "max_hours": null, "action": "search", "risk_tolerance": null}
+- "show me btc bets expiring in 1h" → {"search_terms": ["bitcoin", "btc"], "max_hours": 1, "action": "search"}
+- "analyze btc 15min" → {"search_terms": ["bitcoin", "btc", "up or down", "15"], "max_hours": null, "action": "analyze"}
+- "analyze crypto markets closing in 15min" → {"search_terms": ["crypto", "bitcoin", "ethereum"], "max_hours": 0.25, "action": "analyze"}
+- "what political bets are there?" → {"search_terms": ["politics", "trump", "election"], "max_hours": null, "action": "search"}
+- "btc 1h markets" → {"search_terms": ["bitcoin", "btc", "up or down", "1h"], "max_hours": null, "action": "search"}
+- "eth 5min" → {"search_terms": ["ethereum", "eth", "up or down", "5"], "max_hours": null, "action": "search"}
 
 Respond with JSON only.\
 """
@@ -66,6 +63,10 @@ LIVE spot price from Binance and the market's reference price. This is your MOST
   - **Check the "Dynamic Risk Assessment" section** — it shows how much the price has actually \
 swung during the observation window. A $300 lead means nothing if the price swung $500 in the last 5 minutes.
   - **This is real external data, not market opinion. Trust it over order book sentiment.**
+  - **Chainlink vs Binance**: These markets resolve using the Chainlink oracle price feed. Chainlink \
+aggregates prices from multiple exchanges including Binance. In practice, Chainlink BTC/USD and \
+Binance BTCUSDT differ by only a few dollars (< 0.01%). **Treat the Binance spot price as a reliable \
+proxy for the Chainlink resolution price.** Do NOT skip trades due to the Chainlink/Binance distinction.
 - **Momentum**: If price has been trending up (series of higher prices), that suggests \
 YES is gaining. If trending down, NO side is gaining.
 - **Order book pressure**: bid_ask_ratio > 1 means more buying pressure (bullish for YES). \
@@ -118,6 +119,10 @@ reference, the probability of it staying there increases (less time for reversal
 - **SKIP = guaranteed loss of opportunity**: these markets expire quickly, so being in the market \
 with even a small edge is better than missing it entirely.
 - **Lower your edge threshold**: for markets expiring in < 30 minutes, an edge of 2 cents is actionable.
+- **Near-certain outcomes are STILL worth trading**: If signal strength is >= 2x and the outcome is \
+nearly certain (e.g. 97%+ probability), BUY even if the market price is close to the true probability. \
+A 2-3 cent edge on a near-certain outcome is FREE MONEY. Do NOT skip these. Example: if NO is ~97% \
+likely and NO trades at $0.95, that's a 2-cent edge with 97% certainty — BUY_NO, do NOT skip.
 
 ### Common mistakes to AVOID
 - **DO NOT BUY_NO just because the price dipped slightly while still above reference.** \
@@ -138,36 +143,92 @@ Always respond with ONLY valid JSON (no markdown, no extra text) matching this s
 {
   "recommendation": "BUY_YES" | "BUY_NO" | "SKIP",
   "confidence": 0.0 to 1.0,
-  "estimated_probability": 0.0 to 1.0,
+  "estimated_probability": 0.0 to 1.0 (probability that YES wins, NOT the recommended side),
   "reasoning": "short explanation, max 2 sentences",
   "suggested_price": 0.0 to 1.0 or null,
   "suggested_size": number or null
 }
+
+CRITICAL: "estimated_probability" is ALWAYS the probability that YES/Up wins.
+- If you recommend BUY_YES because YES is likely, estimated_probability should be HIGH (e.g. 0.85)
+- If you recommend BUY_NO because NO is likely, estimated_probability should be LOW (e.g. 0.05)
+- Example: BTC is $300 below reference → NO will win → estimated_probability = 0.02 (YES has only 2% chance)
+
+BE PRECISE with extreme probabilities — the difference between 0.03 and 0.005 matters for edge calculations:
+- Signal strength >= 2x with < 5 min left → the side with the lead has > 99% probability. Use 0.995+ or 0.005-.
+- Signal strength >= 3x with < 3 min left → use 0.998+ or 0.002-.
+- Signal strength >= 5x → use 0.999+ or 0.001-.
+- Do NOT round to 0.95 or 0.97 when the math says 99.5%+. Precision at the extremes is critical.
 """
 
-RISK_INSTRUCTIONS = {
-    "_default": (
-        "\n## Risk Profile\n"
-        "The user has described their risk tolerance as: \"{risk_tolerance}\"\n\n"
-        "Adapt your analysis to match this risk profile:\n"
-        "- Adjust the minimum edge you require before recommending a trade. "
-        "A more aggressive profile means you can recommend trades with smaller edges; "
-        "a conservative profile means you need larger mispricings.\n"
-        "- Adjust suggested_size relative to the user's tolerance. "
-        "Aggressive → larger positions, conservative → smaller positions.\n"
-        "- Adjust confidence thresholds. "
-        "Conservative → only recommend when very confident, aggressive → act on weaker signals.\n"
-        "- Always explain in your reasoning how the risk profile influenced your decision.\n"
-    ),
-}
-
-
-def build_system_prompt(risk_tolerance: str) -> str:
-    """Build the full system prompt including risk instructions."""
+def build_system_prompt() -> str:
+    """Build the full system prompt with hardcoded risk profile."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     base = SYSTEM_PROMPT.replace("{current_time}", now)
-    risk_block = RISK_INSTRUCTIONS["_default"].format(risk_tolerance=risk_tolerance)
+    risk_block = (
+        "\n## Risk Profile (Hardcoded)\n"
+        "You are optimized for 15-minute crypto up/down markets.\n\n"
+        "- Prioritize capital preservation over maximizing edge.\n"
+        "- Only recommend trades with high confidence and clear signals.\n"
+        "- A 5% safe gain is better than a 20% risky one.\n"
+        "- Prefer entering late when the outcome direction is clear over early speculative entries.\n"
+    )
     return base + risk_block
+
+
+def compute_signal_strength(
+    spot_price_info: dict | None,
+    price_tracker_data: list[dict] | None,
+    end_date: str,
+) -> float | None:
+    """Compute signal strength from observed volatility data.
+
+    Returns the signal strength multiplier (e.g. 2.5x expected swing),
+    or None if there isn't enough data to compute it.
+    """
+    if not price_tracker_data or len(price_tracker_data) < 3:
+        return None
+    if not spot_price_info or spot_price_info.get("price_diff") is None:
+        return None
+
+    now = datetime.now(timezone.utc)
+    total_seconds = 0.0
+    if end_date and end_date != "unknown":
+        try:
+            end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            total_seconds = (end_dt - now).total_seconds()
+        except (ValueError, TypeError):
+            pass
+    if total_seconds <= 0:
+        return None
+
+    spots = [s["spot_price"] for s in price_tracker_data]
+    n = len(spots)
+    consec_changes = [abs(spots[i] - spots[i - 1]) for i in range(1, n)]
+    avg_change = sum(consec_changes) / len(consec_changes)
+
+    sample_interval_s = 10.0
+    if n >= 2:
+        try:
+            t0 = datetime.strptime(price_tracker_data[0]["timestamp"], "%H:%M:%S")
+            t1 = datetime.strptime(price_tracker_data[-1]["timestamp"], "%H:%M:%S")
+            span_s = (t1 - t0).total_seconds()
+            if span_s > 0:
+                sample_interval_s = span_s / (n - 1)
+        except (KeyError, ValueError):
+            pass
+
+    sigma_per_step = avg_change
+    steps_per_min = 60.0 / sample_interval_s if sample_interval_s > 0 else 6
+    mins_left = total_seconds / 60
+    steps_remaining = mins_left * steps_per_min
+    expected_swing = sigma_per_step * math.sqrt(steps_remaining) if steps_remaining > 0 else 0
+
+    abs_diff = abs(spot_price_info["price_diff"])
+    if expected_swing <= 0:
+        return None
+
+    return abs_diff / expected_swing
 
 
 def build_analysis_prompt(

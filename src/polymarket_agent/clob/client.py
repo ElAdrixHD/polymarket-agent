@@ -116,6 +116,9 @@ def get_orderbook(token_id: str) -> dict[str, Any]:
 def buy(token_id: str, price: float, size: float) -> dict[str, Any]:
     """Place a GTC buy order."""
     client = _get_client()
+    # Round to required precision: price (maker) 2 decimals, size (taker) 4 decimals
+    price = round(price, 2)
+    size = round(size, 4)
     order_args = OrderArgs(
         price=price,
         size=size,
@@ -129,6 +132,9 @@ def buy(token_id: str, price: float, size: float) -> dict[str, Any]:
 def sell(token_id: str, price: float, size: float) -> dict[str, Any]:
     """Place a GTC sell order."""
     client = _get_client()
+    # Round to required precision: price (maker) 2 decimals, size (taker) 4 decimals
+    price = round(price, 2)
+    size = round(size, 4)
     order_args = OrderArgs(
         price=price,
         size=size,
@@ -148,6 +154,9 @@ def market_buy(token_id: str, amount: float, max_price: float = 0.99) -> dict[st
     client = _get_client()
     # Clamp to valid Polymarket range
     price = max(0.01, min(max_price, 0.99))
+    # Round to required precision: price (maker) 2 decimals, size (taker) 4 decimals
+    price = round(price, 2)
+    amount = round(amount, 4)
     order_args = OrderArgs(
         price=price,
         size=amount,
@@ -253,12 +262,32 @@ def get_orderbook_summary(token_id: str) -> dict[str, Any]:
         bid_depth = sum(_get(o, "size") for o in bids)
         ask_depth = sum(_get(o, "size") for o in asks)
 
-        best_bid = _get(bids[0], "price") if bids else 0.0
-        best_ask = _get(asks[0], "price") if asks else 1.0
+        # Don't assume sort order — explicitly find best prices
+        best_bid = max((_get(o, "price") for o in bids), default=0.0)
+        best_ask = min((_get(o, "price") for o in asks), default=1.0)
 
         spread = best_ask - best_bid
         midpoint = (best_bid + best_ask) / 2 if (best_bid + best_ask) else 0.5
         ratio = bid_depth / ask_depth if ask_depth else float("inf")
+
+        # Extract min_order_size from book response (fallback to 5.0)
+        min_order_size = 5.0
+        if hasattr(book, "min_tick_size"):
+            try:
+                min_order_size = float(book.min_tick_size) or 5.0
+            except (ValueError, TypeError):
+                pass
+        elif isinstance(book, dict) and "min_tick_size" in book:
+            try:
+                min_order_size = float(book["min_tick_size"]) or 5.0
+            except (ValueError, TypeError):
+                pass
+
+        logger.info(
+            "Orderbook %s…: best_bid=%.4f best_ask=%.4f spread=%.4f "
+            "bids=%d asks=%d",
+            token_id[:16], best_bid, best_ask, spread, len(bids), len(asks),
+        )
 
         return {
             "best_bid": best_bid,
@@ -268,6 +297,7 @@ def get_orderbook_summary(token_id: str) -> dict[str, Any]:
             "bid_depth": round(bid_depth, 2),
             "ask_depth": round(ask_depth, 2),
             "bid_ask_ratio": round(ratio, 3),
+            "min_order_size": min_order_size,
         }
     except Exception as exc:
         logger.warning("Failed to get orderbook summary: %s", exc)

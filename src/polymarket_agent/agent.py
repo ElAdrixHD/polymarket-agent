@@ -12,9 +12,7 @@ from rich.table import Table
 from polymarket_agent.analyst.llm import (
     clear_all_window_state,
     get_order_history,
-    get_reasoning_history,
     record_order,
-    record_reasoning,
 )
 from polymarket_agent.crypto_prices import (
     PriceTracker,
@@ -31,12 +29,9 @@ from polymarket_agent.strategies.llm_strategy import LLMStrategy
 log = logging.getLogger(__name__)
 console = Console()
 
-# Minimum % of window that must have elapsed before analysis (by risk level)
-_MIN_ELAPSED_PCT: dict[str, float] = {
-    "conservative": 0.60,
-    "moderate": 0.40,
-    "aggressive": 0.15,
-}
+# Minimum % of window that must have elapsed before analysis begins
+# Low value: we only need ~30s of price data to start computing volatility
+_MIN_ELAPSED_PCT = 0.04
 
 
 async def scan_markets(limit: int = 20) -> list[dict]:
@@ -89,48 +84,67 @@ async def _analyze_asset(
     positions: list[dict],
     price_tracker: PriceTracker,
     asset: str,
+    bankroll: float | None = None,
 ) -> dict | None:
-    """Run LLM analysis for a single asset/market. Returns signal dict or None.
+    """Analyze a single asset. Returns signal dict or None.
 
-    Always records reasoning from the analysis so the AI builds context
-    across cycles, even when the trade is blocked by low confidence.
+    Accumulates price data for most of the window. In the last trade_window_secs,
+    calls LLM with full price history → LLM decides direction + confidence → sizing.
     """
     mk = _market_key(market)
     tracker_data = price_tracker.get_history(asset)
-    reasoning = get_reasoning_history(mk)
+
+    # Compute time remaining
+    _, end_dt = _parse_window_times(market)
+    time_remaining_secs: float | None = None
+    if end_dt:
+        time_remaining_secs = (end_dt - datetime.now(timezone.utc)).total_seconds()
+        if time_remaining_secs < 0:
+            time_remaining_secs = 0
+
+    # Build spot_price_info from tracker data (uses already-collected prices)
+    spot_price_info = None
+    if tracker_data:
+        last = tracker_data[-1]
+        if last.get("reference_price") is not None:
+            spot_price_info = {
+                "asset": asset.upper(),
+                "spot_price": last["spot_price"],
+                "reference_price": last["reference_price"],
+                "price_diff": last["diff"],
+                "price_diff_pct": last.get("diff_pct"),
+            }
 
     try:
-        signal, analysis = await strategy.evaluate(
+        signal, info = await strategy.evaluate(
             market,
             positions,
             price_tracker_data=tracker_data,
-            reasoning_chain=reasoning,
+            time_remaining_secs=time_remaining_secs,
+            bankroll=bankroll,
+            spot_price_info=spot_price_info,
         )
     except Exception as exc:
         log.error("Error evaluating %s: %s", asset, exc)
         return None
 
-    # Always record AI reasoning so it accumulates across cycles
-    last_spot = tracker_data[-1]["spot_price"] if tracker_data else None
-    last_ref = tracker_data[-1].get("reference_price") if tracker_data else None
-    record_reasoning(
-        market_key=mk,
-        recommendation=analysis.recommendation,
-        confidence=analysis.confidence,
-        reasoning=analysis.reasoning,
-        spot_price=last_spot,
-        reference_price=last_ref,
-    )
-
     if signal is None:
-        if analysis.recommendation == "SKIP":
-            console.print(f"  [{asset.upper()}] → SKIP ({analysis.confidence:.0%} conf) — {analysis.reasoning[:80]}")
+        sig_str = info.get("signal_strength")
+        sig_display = f"{sig_str:.2f}x" if sig_str is not None else "N/A"
+        rec = info.get("recommendation", "SKIP")
+        # Color based on whether it's a data wait vs LLM skip
+        llm_decided = info.get("llm_decision") is not None
+        if llm_decided:
+            style = "bold yellow"
+            label = f"LLM: {rec}"
         else:
-            console.print(
-                f"  [{asset.upper()}] → [bold yellow]{analysis.recommendation} BLOCKED[/bold yellow] "
-                f"(conf {analysis.confidence:.0%} < min {settings.min_confidence:.0%}) "
-                f"— {analysis.reasoning[:80]}"
-            )
+            style = "dim"
+            label = rec
+        console.print(
+            f"  [{asset.upper()}] → [{style}]{label}[/{style}] "
+            f"(sig={sig_display} conf={info.get('confidence', 0):.0%}) "
+            f"— {info.get('reasoning', '')[:120]}"
+        )
         return None
 
     return {"asset": asset, "market": market, "signal": signal, "market_key": mk}
@@ -254,7 +268,12 @@ async def _analysis_task(
             f"{', '.join(a.upper() for a in ready_for_analysis)}[/bold blue]"
         )
 
-        # Run analysis in parallel for all ready assets
+        # Fetch bankroll once per analysis cycle
+        bankroll = clob.get_balance()
+        if bankroll is not None:
+            console.print(f"  [dim]Bankroll: ${bankroll:.2f}[/dim]")
+
+        # Run analysis in parallel for all ready assets (all local math, no LLM)
         tasks = []
         for asset in ready_for_analysis:
             if asset in traded_assets:
@@ -266,7 +285,7 @@ async def _analysis_task(
                 console.print(f"  [{asset.upper()}] Already traded this window. Skipping.")
                 traded_assets.add(asset)
                 continue
-            tasks.append(_analyze_asset(strategy, m, positions, price_tracker, asset))
+            tasks.append(_analyze_asset(strategy, m, positions, price_tracker, asset, bankroll=bankroll))
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -287,27 +306,22 @@ async def _analysis_task(
 
                 console.print(
                     f"  [{asset.upper()}] → [bold green]{signal.action}[/bold green] "
-                    f"price={signal.price:.2f} size={signal.size:.1f} "
+                    f"best_ask={signal.price:.4f} size={signal.size:.1f} "
                     f"confidence={signal.confidence:.0%}"
                 )
                 console.print(f"    Reasoning: {signal.reasoning[:120]}")
 
-                # Execute trade with liquidity check + retries
-                max_price = round(signal.price + 0.03, 2)
+                # Execute as a market order (FOK) at the best available price.
+                # Edge was already validated in the strategy against the real
+                # best_ask, so we use max_price=0.99 to fill at whatever the
+                # market offers.  The FOK order type ensures we either fill
+                # entirely or not at all.
                 max_retries = 3
                 retry_delay = 1.0  # seconds
 
-                # Pre-flight liquidity check
-                if not clob.check_orderbook_liquidity(signal.token_id, "BUY", signal.size, max_price):
-                    console.print(
-                        f"  [{asset.upper()}] [bold yellow]Skipped:[/bold yellow] "
-                        f"insufficient liquidity (need {signal.size:.1f} @ <={max_price})"
-                    )
-                    continue
-
                 for attempt in range(1, max_retries + 1):
                     try:
-                        order_result = clob.market_buy(signal.token_id, signal.size, max_price=max_price)
+                        order_result = clob.market_buy(signal.token_id, signal.size, max_price=signal.price)
                         console.print(f"  [{asset.upper()}] [bold green]Order placed:[/bold green] {order_result}")
                         record_order(
                             market_key=mk,
@@ -348,8 +362,7 @@ async def _monitor_window(
     if not markets:
         return None
 
-    risk = strategy.risk_tolerance or settings.risk_tolerance
-    min_pct = _MIN_ELAPSED_PCT.get(risk, 0.40)
+    min_pct = _MIN_ELAPSED_PCT
 
     # Build asset → market mapping
     asset_markets: dict[str, dict] = {}
@@ -390,7 +403,7 @@ async def _monitor_window(
         log.warning("Could not fetch positions: %s", exc)
 
     console.print(f"\n[bold]Monitoring {len(asset_markets)} asset(s):[/bold] {', '.join(a.upper() for a in asset_markets)}")
-    console.print(f"Risk: {risk} | Min elapsed: {min_pct:.0%} | Earliest end: {earliest_end}")
+    console.print(f"Trade window: last {settings.trade_window_secs}s | Earliest end: {earliest_end}")
     console.print(f"Price sampling: every {settings.price_sample_interval}s | Analysis: every {settings.analysis_interval}s")
 
     # Create stop event for coordinating task shutdown
@@ -507,13 +520,11 @@ async def _pick_markets() -> _SearchConfig | None:
     return _SearchConfig(terms=parsed.search_terms, max_hours=parsed.max_hours)
 
 
-async def run_loop(risk_tolerance: str | None = None) -> None:
+async def run_loop() -> None:
     """Run the agent in a continuous loop with price accumulation."""
-    risk = risk_tolerance or settings.risk_tolerance
-    console.print("[bold]Starting Polymarket Agent[/bold]")
-    console.print(f"Risk tolerance: [bold yellow]{risk}[/bold yellow]")
+    console.print("[bold]Starting Polymarket Agent (LLM decides, confidence sizes)[/bold]")
     console.print(f"Price sampling: every {settings.price_sample_interval}s | Analysis: every {settings.analysis_interval}s")
-    console.print(f"Max bet: ${settings.max_bet_usdc}")
+    console.print(f"Max bet: ${settings.max_bet_usdc} | Trade window: last {settings.trade_window_secs}s | Sizing: 95%→max, 85%→70%, 75%→40%, 65%→20%")
 
     # Initialize CLOB client
     try:
@@ -529,7 +540,7 @@ async def run_loop(risk_tolerance: str | None = None) -> None:
         console.print("[dim]Aborted.[/dim]")
         return
 
-    strategy = LLMStrategy(risk_tolerance=risk)
+    strategy = LLMStrategy()
     price_tracker = PriceTracker()
 
     while True:

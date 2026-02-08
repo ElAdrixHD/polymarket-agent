@@ -14,6 +14,7 @@ from polymarket_agent.analyst.prompts import (
     QUERY_SYSTEM_PROMPT,
     build_analysis_prompt,
     build_system_prompt,
+    compute_signal_strength,
 )
 from polymarket_agent.config import settings
 
@@ -102,7 +103,6 @@ class ParsedQuery(BaseModel):
     search_terms: list[str]
     max_hours: float | None = None
     action: str = "search"  # "search" or "analyze"
-    risk_tolerance: str | None = None
 
 
 class MarketAnalysis(BaseModel):
@@ -112,6 +112,9 @@ class MarketAnalysis(BaseModel):
     reasoning: str
     suggested_price: float | None = None
     suggested_size: float | None = None
+    # Set after LLM parsing — not from JSON response
+    signal_strength: float | None = None
+    min_order_size: float = 5.0
 
     def __init__(self, **data: Any) -> None:
         # Coerce null estimated_probability to default
@@ -196,6 +199,14 @@ def _parse_analysis(raw: str) -> MarketAnalysis:
         open_braces = repaired.count("{") - repaired.count("}")
         repaired += "}" * open_braces
         data = json.loads(repaired)
+
+    # Normalize confidence and estimated_probability to 0.0-1.0 range
+    # (some LLMs return 0-100 instead of 0.0-1.0)
+    if data.get("confidence") is not None and data["confidence"] > 1.0:
+        data["confidence"] = data["confidence"] / 100.0
+    if data.get("estimated_probability") is not None and data["estimated_probability"] > 1.0:
+        data["estimated_probability"] = data["estimated_probability"] / 100.0
+
     return MarketAnalysis(**data)
 
 
@@ -242,7 +253,6 @@ def extract_token_ids(market: dict[str, Any]) -> dict[str, str]:
 async def analyze_market(
     market: dict[str, Any],
     positions: list[dict] | None = None,
-    risk_tolerance: str | None = None,
     price_tracker_data: list[dict] | None = None,
     reasoning_chain: list[dict] | None = None,
 ) -> MarketAnalysis:
@@ -419,7 +429,7 @@ async def analyze_market(
         reasoning_chain=reasoning_chain,
     )
 
-    system = build_system_prompt(risk_tolerance or settings.risk_tolerance)
+    system = build_system_prompt()
 
     # Retry up to 3 times on empty or malformed JSON responses
     last_err: Exception | None = None
@@ -440,6 +450,14 @@ async def analyze_market(
             )
     else:
         raise last_err  # type: ignore[misc]
+
+    # Compute signal strength from observed volatility
+    end_date_str = market.get("endDate", "unknown")
+    sig_strength = compute_signal_strength(spot_price_info, price_tracker_data, end_date_str)
+    analysis.signal_strength = sig_strength
+
+    # Extract min_order_size from orderbook summary
+    analysis.min_order_size = float(orderbook_summary.get("min_order_size", 5.0)) if orderbook_summary else 5.0
 
     # Record this evaluation in history
     if market_key not in _evaluation_history:

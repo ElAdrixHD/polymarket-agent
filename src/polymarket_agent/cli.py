@@ -11,16 +11,6 @@ from rich.console import Console
 console = Console()
 
 
-def _parse_risk(args: list[str]) -> str | None:
-    """Extract --risk value from args list."""
-    for i, arg in enumerate(args):
-        if arg == "--risk" and i + 1 < len(args):
-            return args[i + 1]
-        if arg.startswith("--risk="):
-            return arg.split("=", 1)[1]
-    return None
-
-
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -38,7 +28,7 @@ def main() -> None:
         _portfolio()
     elif command == "analyze":
         if len(sys.argv) < 3 or sys.argv[2].startswith("--"):
-            console.print("[red]Usage: polymarket-agent analyze <market-slug> [--risk <tolerance>][/red]")
+            console.print("[red]Usage: polymarket-agent analyze <market-slug>[/red]")
             sys.exit(1)
         _analyze(sys.argv[2])
     elif command == "ask":
@@ -54,29 +44,22 @@ def main() -> None:
 def _usage() -> None:
     console.print("[bold]Polymarket Agent[/bold]\n")
     console.print("Commands:")
-    console.print("  run [--risk <tolerance>]            Run the autonomous agent loop")
+    console.print("  run                                 Run the autonomous agent loop")
     console.print("  scan                                Scan markets without trading")
     console.print("  portfolio                           Show current positions")
-    console.print("  analyze <slug> [--risk <tolerance>]  Analyze a specific market")
+    console.print("  analyze <slug>                      Analyze a specific market")
     console.print("  ask <query>                         Natural language market search & analysis")
     console.print()
     console.print("Ask examples:")
     console.print('  ask analyze btc bets expiring in 15min')
     console.print('  ask show me crypto markets closing in 1h')
     console.print('  ask what political bets are there?')
-    console.print('  ask analyze sports markets aggressively')
-    console.print()
-    console.print("Risk tolerance examples:")
-    console.print('  --risk "conservative, only bet on very clear mispricings"')
-    console.print('  --risk "aggressive, I want high returns and accept losses"')
-    console.print('  --risk "only sports markets, moderate risk"')
 
 
 def _run() -> None:
     from polymarket_agent.agent import run_loop
 
-    risk = _parse_risk(sys.argv[2:])
-    asyncio.run(run_loop(risk_tolerance=risk))
+    asyncio.run(run_loop())
 
 
 def _scan() -> None:
@@ -133,17 +116,13 @@ def _analyze(slug: str) -> None:
     from polymarket_agent.analyst.llm import analyze_market
     from polymarket_agent.gamma import client as gamma
 
-    risk = _parse_risk(sys.argv[3:])
-
     async def _do() -> None:
         console.print(f"Fetching market: [cyan]{slug}[/cyan]")
         market = await gamma.get_market(slug)
         console.print(f"Question: [bold]{market.get('question', '?')}[/bold]")
 
-        if risk:
-            console.print(f"Risk tolerance: [bold yellow]{risk}[/bold yellow]")
         console.print("Analyzing with LLM...")
-        analysis = await analyze_market(market, risk_tolerance=risk)
+        analysis = await analyze_market(market)
 
         console.print(f"\n[bold]Recommendation:[/bold] {analysis.recommendation}")
         console.print(f"[bold]Confidence:[/bold] {analysis.confidence:.0%}")
@@ -174,9 +153,6 @@ def _ask(query: str) -> None:
             else:
                 console.print(f"Time filter: expiring within [yellow]{parsed.max_hours:.0f} hours[/yellow]")
         console.print(f"Action: [bold]{parsed.action}[/bold]")
-        if parsed.risk_tolerance:
-            console.print(f"Risk tolerance: [bold yellow]{parsed.risk_tolerance}[/bold yellow]")
-
         console.print("\nSearching markets...")
         markets = await gamma.search_and_filter(
             terms=parsed.search_terms,
@@ -212,7 +188,7 @@ def _ask(query: str) -> None:
                 question = m.get("question", "?")
                 console.print(f"\n[bold blue]({i}/{len(markets)}) {question}[/bold blue]")
                 try:
-                    analysis = await analyze_market(m, risk_tolerance=parsed.risk_tolerance)
+                    analysis = await analyze_market(m)
                     rec_color = "green" if analysis.recommendation != "SKIP" else "dim"
                     console.print(f"  Recommendation: [{rec_color}]{analysis.recommendation}[/{rec_color}]")
                     console.print(f"  Confidence: {analysis.confidence:.0%}")
